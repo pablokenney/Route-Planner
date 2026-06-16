@@ -13,6 +13,7 @@ saved starts, result caching, and milestone mode (exact waypoints, padded distan
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 
@@ -22,8 +23,18 @@ import requests
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 
-from .generator import HOME, MI, SURFACE_CHOICES, generate, round_trip_body, surface_custom_model
+from .generator import (
+    HOME,
+    MI,
+    SURFACE_CHOICES,
+    generate,
+    parse_instructions,
+    round_trip_body,
+    surface_custom_model,
+    synthesize_turns,
+)
 from .milestone import milestone as milestone_generate
+from .outback import out_and_backs
 
 GH = os.environ.get("GH_URL", "http://localhost:8989")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -46,9 +57,10 @@ _ROUTES_TTL_S = 15 * 60
 _ROUTES_CACHE_MAX = 128
 
 
-def _cache_key(miles, lat, lon, n, tolerance, k, surface) -> tuple:
+def _cache_key(miles, lat, lon, n, tolerance, k, surface, out_back) -> tuple:
     # Round coords to ~11 m so trivially-different geocodes of the same place share a result.
-    return (round(miles, 2), round(lat, 4), round(lon, 4), n, round(tolerance, 3), k, surface)
+    return (round(miles, 2), round(lat, 4), round(lon, 4), n, round(tolerance, 3), k,
+            surface, out_back)
 
 
 def _cache_get(key: tuple) -> dict | None:
@@ -79,26 +91,31 @@ async def routes(
     tolerance: float = Query(0.08, ge=0.02, le=0.25),
     k: int = Query(5, ge=1, le=8),
     surface: str = Query("any"),
+    out_back: bool = Query(True),
     fresh: bool = Query(False),
 ):
     """Ranked in-band candidate loops from (lat, lon). Honest shortfall flag if none hit tolerance.
 
     surface: 'any' (default), 'paved', or 'unpaved' — a soft preference (PLAN.md §Phase 4).
+    out_back: also generate pure out-and-back routes and rank them alongside loops (default
+              on); each carries route_type and overlap_pct so the UI can flag retracing.
     fresh=true bypasses the result cache to draw new variety.
     """
     surface = surface.lower()
     if surface not in SURFACE_CHOICES:
         raise HTTPException(422, f"surface must be one of {SURFACE_CHOICES}")
 
-    key = _cache_key(miles, lat, lon, n, tolerance, k, surface)
+    key = _cache_key(miles, lat, lon, n, tolerance, k, surface, out_back)
     if not fresh:
         cached = _cache_get(key)
         if cached is not None:
             return {**cached, "cached": True}
 
     try:
+        extra = (await out_and_backs(start=(lat, lon), target_m=miles * MI, surface=surface)
+                 if out_back else None)
         result = await generate(miles * MI, n=n, tolerance=tolerance, k=k,
-                                start=(lat, lon), surface=surface)
+                                start=(lat, lon), surface=surface, extra_candidates=extra)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"Generation failed (is GraphHopper up?): {e}")
     if not result["candidates"]:
@@ -131,15 +148,19 @@ async def route(distance_m: int = Query(5000, ge=1000, le=25000),
     }
 
 
-def _round_trip(distance_m: int, seed: int, start, surface: str) -> dict:
-    """Synchronous single round_trip — used only to reproduce a chosen loop for GPX.
+def _round_trip(distance_m: int, seed: int, start, surface: str,
+                instructions: bool = False) -> dict:
+    """Synchronous single round_trip — used only to reproduce a chosen loop for GPX/directions.
 
     Must use the SAME profile + surface custom model the candidate was generated with, or
     the reproduced geometry drifts from what the user picked. POST carries the custom model.
+    instructions=True additionally asks GraphHopper for the turn-by-turn list.
     """
     try:
         r = requests.post(f"{GH}/route",
-                          json=round_trip_body(seed, distance_m, start, surface_custom_model(surface)),
+                          json=round_trip_body(seed, distance_m, start,
+                                               surface_custom_model(surface),
+                                               instructions=instructions),
                           timeout=60)
     except requests.ConnectionError:
         raise HTTPException(503, "GraphHopper not reachable at :8989")
@@ -171,6 +192,29 @@ def gpx(distance_m: int = Query(5000, ge=500, le=30000), seed: int = 1,
         seg.points.append(gpxpy.gpx.GPXTrackPoint(latitude=c[1], longitude=c[0], elevation=ele))
     return Response(content=g.to_xml(), media_type="application/gpx+xml",
                     headers={"Content-Disposition": f'attachment; filename="loop_{distance_m}m.gpx"'})
+
+
+# ------------------------------------------------------------------ turn-by-turn directions
+@app.get("/api/directions")
+def directions(distance_m: int = Query(5000, ge=500, le=30000), seed: int = 1,
+               lat: float = Query(HOME[0]), lon: float = Query(HOME[1]),
+               surface: str = Query("any")):
+    """Step-by-step turn list for a loop, reproduced from (start, gen_distance_m, seed,
+    surface) exactly like /api/gpx but with GraphHopper instructions enabled. Returns the
+    compact turn list (parse_instructions) plus the geometry so the UI/exports can place each
+    cue. For milestone/out-and-back composites that no single round_trip reproduces, the UI
+    instead POSTs geometry to /api/directions_track (instructions are requested per leg
+    upstream). This GET path covers the common loop case.
+    """
+    surface = surface.lower()
+    if surface not in SURFACE_CHOICES:
+        raise HTTPException(422, f"surface must be one of {SURFACE_CHOICES}")
+    p = _round_trip(distance_m, seed, (lat, lon), surface, instructions=True)
+    return {
+        "turns": parse_instructions(p),
+        "latlngs": [[c[1], c[0]] for c in p["points"]["coordinates"]],
+        "distance_m": round(float(p.get("distance", 0.0)), 1),
+    }
 
 
 # ------------------------------------------------------------------------- geocoding
@@ -407,6 +451,126 @@ def gpx_track(payload: dict = Body(...)):
     fname = name.lower().replace(" ", "_")[:40] or "milestone"
     return Response(content=g.to_xml(), media_type="application/gpx+xml",
                     headers={"Content-Disposition": f'attachment; filename="{fname}.gpx"'})
+
+
+@app.post("/api/directions_track")
+def directions_track(payload: dict = Body(...)):
+    """Turn list synthesized from arbitrary geometry: {latlngs:[[lat,lon],...]}. For
+    out-and-back and milestone composites that no single round_trip reproduces, so GH
+    instructions aren't available — bend detection (synthesize_turns) stands in, exactly as a
+    watch app would. Returns the same turn shape as GET /api/directions."""
+    latlngs = payload.get("latlngs")
+    if not isinstance(latlngs, list) or len(latlngs) < 2:
+        raise HTTPException(422, "latlngs must be a list of at least two [lat, lon] points")
+    coords = [[pt[1], pt[0]] for pt in latlngs]  # [lat,lon] -> [lon,lat]
+    return {"turns": synthesize_turns(coords)}
+
+
+# ----------------------------------------------------------------- TCX (Apple Watch) export
+# GraphHopper turn `sign` -> TCX CoursePoint PointType. TCX PointTypes are a fixed enum;
+# we map to the closest navigation cue. Distance-tagged course points are unambiguous on
+# loops/out-and-backs where a lat/lon recurs (GPX route-points are not) — PLAN.md §Feature 4.
+_SIGN_TO_POINTTYPE = {
+    -3: "Left", -2: "Left", -1: "Left",
+    0: "Straight", 1: "Right", 2: "Right", 3: "Right",
+    4: "Generic",   # arrive / finish
+    5: "Generic", 6: "Generic", 7: "Straight", -7: "Straight",
+}
+
+
+def _tcx_xml(latlngs: list, elevations: list, turns: list, name: str) -> str:
+    """Hand-build a minimal TCX Course (schema is small; no dependency needed). A <Track> of
+    Trackpoints with cumulative DistanceMeters + position + altitude, and <CoursePoint>s for
+    turns placed at their cumulative distance and nearest trackpoint. Importable by
+    WorkOutDoors / Footpath etc. for on-watch turn-by-turn."""
+    from xml.sax.saxutils import escape
+
+    def _hav_m(a, b):  # local haversine on [lat, lon]
+        R = 6371000.0
+        la1, lo1, la2, lo2 = map(math.radians, [a[0], a[1], b[0], b[1]])
+        h = (math.sin((la2 - la1) / 2) ** 2
+             + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2)
+        return 2 * R * math.asin(math.sqrt(h))
+
+    # Cumulative distance at each trackpoint (drives DistanceMeters and course-point placement).
+    cum = [0.0]
+    for i in range(1, len(latlngs)):
+        cum.append(cum[-1] + _hav_m(latlngs[i - 1], latlngs[i]))
+    total = cum[-1]
+    # A synthetic, monotonically increasing time axis (TCX requires <Time>); 1 s per metre is
+    # arbitrary but valid and keeps course points orderable. No real pace is implied.
+    t0 = "2024-01-01T00:00:00Z"
+
+    def _iso(sec: float) -> str:
+        s = int(sec)
+        h, rem = divmod(s, 3600)
+        m, ss = divmod(rem, 60)
+        return f"2024-01-01T{h:02d}:{m:02d}:{ss:02d}Z"
+
+    pts = []
+    for i, (lat, lon) in enumerate(latlngs):
+        ele = elevations[i] if i < len(elevations) and elevations[i] is not None else None
+        ele_xml = f"<AltitudeMeters>{ele}</AltitudeMeters>" if ele is not None else ""
+        pts.append(
+            f"<Trackpoint><Time>{_iso(cum[i])}</Time>"
+            f"<Position><LatitudeDegrees>{lat}</LatitudeDegrees>"
+            f"<LongitudeDegrees>{lon}</LongitudeDegrees></Position>"
+            f"{ele_xml}<DistanceMeters>{cum[i]:.1f}</DistanceMeters></Trackpoint>")
+
+    cps = []
+    for tn in turns or []:
+        cm = float(tn.get("cumulative_m", 0.0))
+        # nearest trackpoint index by cumulative distance (course points reference a Time).
+        idx = min(range(len(cum)), key=lambda j: abs(cum[j] - cm))
+        lat, lon = latlngs[idx]
+        ptype = _SIGN_TO_POINTTYPE.get(int(tn.get("sign", 0)), "Generic")
+        notes = escape(str(tn.get("text", "")))[:80] or ptype
+        cps.append(
+            f"<CoursePoint><Name>{notes[:10] or ptype}</Name><Time>{_iso(cum[idx])}</Time>"
+            f"<Position><LatitudeDegrees>{lat}</LatitudeDegrees>"
+            f"<LongitudeDegrees>{lon}</LongitudeDegrees></Position>"
+            f"<PointType>{ptype}</PointType><Notes>{notes}</Notes></CoursePoint>")
+
+    cname = escape(name)[:64] or "Route"
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<TrainingCenterDatabase '
+        'xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xsi:schemaLocation="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2 '
+        'http://www.garmin.com/xmlschemas/TrainingCenterDatabasev2.xsd">'
+        f'<Courses><Course><Name>{cname}</Name>'
+        f'<Lap><TotalTimeSeconds>{total:.0f}</TotalTimeSeconds>'
+        f'<DistanceMeters>{total:.1f}</DistanceMeters>'
+        '<BeginPosition>'
+        f'<LatitudeDegrees>{latlngs[0][0]}</LatitudeDegrees>'
+        f'<LongitudeDegrees>{latlngs[0][1]}</LongitudeDegrees></BeginPosition>'
+        '<EndPosition>'
+        f'<LatitudeDegrees>{latlngs[-1][0]}</LatitudeDegrees>'
+        f'<LongitudeDegrees>{latlngs[-1][1]}</LongitudeDegrees></EndPosition></Lap>'
+        f'<Track>{"".join(pts)}</Track>{"".join(cps)}'
+        '</Course></Courses></TrainingCenterDatabase>')
+
+
+@app.post("/api/tcx_track")
+def tcx_track(payload: dict = Body(...)):
+    """Build a TCX Course from geometry + turn cues for Apple Watch turn-by-turn (PLAN.md
+    §Feature 4): {latlngs:[[lat,lon],...], elevations:[m|null,...], turns:[...]?, name?}.
+    If `turns` is omitted, they are synthesized from the geometry (bend detection). Course
+    points carry distance/Time so they stay unambiguous on retraced out-and-backs."""
+    latlngs = payload.get("latlngs")
+    if not isinstance(latlngs, list) or len(latlngs) < 2:
+        raise HTTPException(422, "latlngs must be a list of at least two [lat, lon] points")
+    elevations = payload.get("elevations") or []
+    name = str(payload.get("name", "Route"))
+    turns = payload.get("turns")
+    if not turns:
+        coords = [[pt[1], pt[0]] for pt in latlngs]
+        turns = synthesize_turns(coords)
+    xml = _tcx_xml(latlngs, elevations, turns, name)
+    fname = name.lower().replace(" ", "_")[:40] or "route"
+    return Response(content=xml, media_type="application/vnd.garmin.tcx+xml",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}.tcx"'})
 
 
 # ---------------------------------------------------------------------------- static

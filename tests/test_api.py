@@ -61,7 +61,8 @@ def test_routes_rejects_bad_surface(client):
 
 def test_cache_key_rounds_nearby_coords_together():
     from backend.main import _cache_key
-    a = _cache_key(5.0, 40.195016, -77.199929, 25, 0.08, 5, "paved")
-    b = _cache_key(5.001, 40.1950161, -77.1999291, 25, 0.08, 5, "paved")
+    a = _cache_key(5.0, 40.195016, -77.199929, 25, 0.08, 5, "paved", True)
+    b = _cache_key(5.001, 40.1950161, -77.1999291, 25, 0.08, 5, "paved", True)
     assert a == b  # same place, ~11 m rounding -> shared cache entry
-    assert a != _cache_key(5.0, 40.195016, -77.199929, 25, 0.08, 5, "any")  # surface matters
+    assert a != _cache_key(5.0, 40.195016, -77.199929, 25, 0.08, 5, "any", True)  # surface matters
+    assert a != _cache_key(5.0, 40.195016, -77.199929, 25, 0.08, 5, "paved", False)  # out_back matters

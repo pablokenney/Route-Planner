@@ -56,6 +56,11 @@
     .mixbar { display:flex; height:7px; border-radius:4px; overflow:hidden; margin:8px 0 5px; }
     .mixbar span { height:100%; }
     .mixtext { font-size:11px; color:var(--muted); line-height:1.4; }
+    .badges { display:flex; flex-wrap:wrap; gap:5px; margin-top:6px; }
+    .badge { font-size:10px; padding:2px 6px; border-radius:10px; background:#1e293b; color:var(--muted); }
+    .badge.ob { background:#3b2f1e; color:#fbbf24; }
+    .badge.loop { background:#1e293b; color:#94a3b8; }
+    .badge.seg { background:#1e2f24; color:#34d399; }
     .stage { flex:1; display:flex; flex-direction:column; min-width:0; }
     #map { flex:1; }
     .chartwrap { height:170px; background:var(--panel); border-top:1px solid var(--line);
@@ -63,6 +68,13 @@
     .chartwrap .chdr { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
     canvas#elev { width:100%; height:128px; }
     a.dl { text-decoration:none; }
+    .dirwrap { background:var(--panel); border-top:1px solid var(--line); padding:8px 12px;
+               max-height:200px; overflow-y:auto; }
+    .dirwrap .chdr { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+    .dirtoggle { cursor:pointer; color:#60a5fa; }
+    .dirlist { margin:8px 0 0; padding-left:22px; font-size:12px; color:#cbd5e1; }
+    .dirlist li { margin:3px 0; }
+    .dirlist .turn-d { color:var(--muted); font-size:11px; margin-left:6px; }
   </style>
 </head>
 <body>
@@ -148,6 +160,13 @@
         <div class="chdr"><span id="chartTitle">Elevation profile</span><span id="chartGain"></span></div>
         <canvas id="elev"></canvas>
       </div>
+      <div class="dirwrap" id="dirwrap">
+        <div class="chdr">
+          <span id="dirTitle">Directions</span>
+          <span id="dirToggle" class="dirtoggle">show</span>
+        </div>
+        <ol id="dirlist" class="dirlist" style="display:none"></ol>
+      </div>
     </div>
   </div>
 
@@ -163,7 +182,7 @@
 
   let state = { start: HOME.slice(), startName: 'Home', miles: 5, surface: 'any',
                 data: null, sel: -1, layers: [], chart: null, starts: [],
-                mode: 'loops', pad: true,
+                mode: 'loops', pad: true, turns: [],
                 waypoints: [], wpMarkers: [], snapMarkers: [], milestones: [] };
 
   const map = L.map('map', { zoomControl: true }).setView(HOME, 14);
@@ -192,6 +211,17 @@
     return { bar, txt };
   }
 
+  function badges(c){
+    const b = [];
+    if(c.route_type==='out_and_back')
+      b.push(`<span class="badge ob">↩ out & back · ${Math.round(c.overlap_pct||0)}% retraced</span>`);
+    else
+      b.push('<span class="badge loop">◯ loop</span>');
+    if(c.segments && c.segments.length)
+      b.push(`<span class="badge seg">★ ${c.segments.length} segment${c.segments.length>1?'s':''}</span>`);
+    return b.join('');
+  }
+
   function renderCards(){
     const wrap = document.getElementById('cards'); wrap.innerHTML='';
     state.data.candidates.forEach((c,i)=>{
@@ -205,7 +235,8 @@
           <span class="gain">+${Math.round(c.ascend_m*M2FT)} ft</span>
         </div>
         <div class="mixbar">${bar}</div>
-        <div class="mixtext">${txt}</div>`;
+        <div class="mixtext">${txt}</div>
+        <div class="badges">${badges(c)}</div>`;
       div.onclick = ()=>select(i);
       div.onmouseenter = ()=>highlight(i,true);
       div.onmouseleave = ()=>highlight(i,false);
@@ -235,29 +266,92 @@
     renderCards();
     renderChart(state.data.candidates[i]);
     const c = state.data.candidates[i];
+    // A loop reproducible by round_trip seed (NOT a milestone composite or out-and-back) can
+    // use the param-based GPX/directions endpoints; everything else works from geometry.
+    const reproducible = state.mode!=='milestone' && c.route_type!=='out_and_back';
     const dl = document.getElementById('dlbtn');
-    if(state.mode==='milestone'){
-      // Milestone candidates (esp. decomposed composites) can't be reproduced by a single
-      // round_trip, so download GPX straight from the geometry we already hold.
-      dl.onclick = (e)=>{ e.preventDefault(); downloadTrack(c); };
-      dl.removeAttribute('href');
-    } else {
+    if(reproducible){
       dl.onclick = null;
       dl.href = `/api/gpx?distance_m=${c.gen_distance_m}&seed=${c.seed}&lat=${state.start[0]}&lon=${state.start[1]}&surface=${state.surface}`;
+    } else {
+      // Composites (milestone, out-and-back) can't be reproduced by a single round_trip seed,
+      // so download GPX straight from the geometry we already hold.
+      dl.onclick = (e)=>{ e.preventDefault(); downloadTrack(c); };
+      dl.removeAttribute('href');
     }
+    loadDirections(c, reproducible);
   }
 
-  // POST geometry to /api/gpx_track and trigger a download (used in milestone mode).
+  // POST geometry to /api/gpx_track and trigger a download (milestone + out-and-back composites).
   async function downloadTrack(c){
+    const nm = routeName(c);
     try{
       const r = await fetch('/api/gpx_track', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ latlngs:c.latlngs, elevations:c.elevations,
-          name:`Milestone ${c.distance_mi.toFixed(1)}mi` }) });
+        body: JSON.stringify({ latlngs:c.latlngs, elevations:c.elevations, name:nm }) });
       if(!r.ok){ setStatus('GPX error: '+(await r.text()), true); return; }
-      const blob = await r.blob(); const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href=url; a.download=`milestone_${c.distance_mi.toFixed(1)}mi.gpx`;
-      a.click(); URL.revokeObjectURL(url);
+      triggerDownload(await r.blob(), nm.toLowerCase().replace(/\s+/g,'_')+'.gpx');
     }catch(e){ setStatus('GPX error: '+e.message, true); }
+  }
+
+  function routeName(c){
+    const kind = c.route_type==='out_and_back' ? 'Out-and-back'
+               : (state.mode==='milestone' ? 'Milestone' : 'Loop');
+    return `${kind} ${c.distance_mi.toFixed(1)}mi`;
+  }
+  function triggerDownload(blob, filename){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download=filename;
+    a.click(); URL.revokeObjectURL(url);
+  }
+
+  // Fetch + render the step-by-step turn list for the selected route. For reproducible loops
+  // we ask GraphHopper for real instructions (GET /api/directions); composites use bend
+  // detection from geometry (POST /api/directions_track). Either path returns the same shape.
+  async function loadDirections(c, reproducible){
+    const list = document.getElementById('dirlist');
+    list.innerHTML = '<li class="turn-d">loading…</li>';
+    try{
+      let turns;
+      if(reproducible){
+        const u = `/api/directions?distance_m=${c.gen_distance_m}&seed=${c.seed}&lat=${state.start[0]}&lon=${state.start[1]}&surface=${state.surface}`;
+        const r = await fetch(u);
+        turns = r.ok ? (await r.json()).turns : null;
+      } else {
+        const r = await fetch('/api/directions_track', { method:'POST',
+          headers:{'Content-Type':'application/json'}, body: JSON.stringify({ latlngs:c.latlngs }) });
+        turns = r.ok ? (await r.json()).turns : null;
+      }
+      state.turns = turns || [];
+      renderDirections(state.turns);
+    }catch(e){ list.innerHTML = `<li class="turn-d">directions unavailable</li>`; state.turns=[]; }
+  }
+
+  function turnIcon(sign){
+    if(sign<=-2) return '↰'; if(sign===-1) return '↖';
+    if(sign===1) return '↗'; if(sign>=2 && sign<4) return '↱';
+    if(sign===4) return '🏁'; return '↑';
+  }
+  function renderDirections(turns){
+    const list = document.getElementById('dirlist');
+    if(!turns || !turns.length){ list.innerHTML = '<li class="turn-d">no turns</li>'; return; }
+    list.innerHTML = turns.map(t=>{
+      const mi = (t.cumulative_m*M2MI).toFixed(2);
+      return `<li>${turnIcon(t.sign)} ${t.text}<span class="turn-d">${mi} mi</span></li>`;
+    }).join('');
+  }
+
+  // Download a TCX course (with distance-tagged turn cues) for Apple Watch turn-by-turn.
+  async function downloadTcx(){
+    if(state.sel<0 || !state.data || !state.data.candidates[state.sel]) return;
+    const c = state.data.candidates[state.sel];
+    const nm = routeName(c);
+    try{
+      const r = await fetch('/api/tcx_track', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ latlngs:c.latlngs, elevations:c.elevations,
+          turns: state.turns||[], name:nm }) });
+      if(!r.ok){ setStatus('TCX error: '+(await r.text()), true); return; }
+      triggerDownload(await r.blob(), nm.toLowerCase().replace(/\s+/g,'_')+'.tcx');
+    }catch(e){ setStatus('TCX error: '+e.message, true); }
   }
 
   function renderChart(c){
@@ -490,11 +584,26 @@
   // Map click drops a waypoint in milestone mode.
   map.on('click', e=>{ if(state.mode==='milestone') addWaypoint(e.latlng.lat, e.latlng.lng); });
 
-  // GPX download button injected into header
+  // GPX + TCX download buttons injected into header
   const dl = document.createElement('a');
   dl.id='dlbtn'; dl.className='dl'; dl.href='#';
   dl.innerHTML='<button class="ghost">⬇ GPX</button>';
   document.querySelector('header .spacer').after(dl);
+
+  const tcx = document.createElement('button');
+  tcx.id='tcxbtn'; tcx.className='ghost';
+  tcx.textContent='⌚ TCX';
+  tcx.title='Course with turn cues for Apple Watch — import into WorkOutDoors / Footpath';
+  tcx.onclick = downloadTcx;
+  dl.after(tcx);
+
+  // Directions panel show/hide toggle.
+  document.getElementById('dirToggle').onclick = ()=>{
+    const list = document.getElementById('dirlist');
+    const shown = list.style.display!=='none';
+    list.style.display = shown ? 'none' : 'block';
+    document.getElementById('dirToggle').textContent = shown ? 'show' : 'hide';
+  };
 
   document.getElementById('go').onclick = generate;
   document.getElementById('setStart').onclick = setStart;
