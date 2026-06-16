@@ -1,9 +1,9 @@
-# GraphHopper config — Phase 0 (composition probe).
+# GraphHopper config — Phase 1.
 # Run via: scripts/run_graphhopper.sh  (plain Java JAR, no Docker)
 #
-# Phase 0 goal: prove round_trip honors the EXCLUSION-only custom model below.
-# Preference multipliers (>1) are intentionally OMITTED until Phase 1 — under flex they
-# belong in the server-side profile, but Phase 0 only needs the exclusions to probe.
+# `run` is the full server-side custom model (PLAN.md §3): Phase 0 exclusions PLUS the
+# preference multipliers (>1, which must live server-side, not per-request). foot_raw and
+# run_noprefs are diagnostic-only profiles used by tests/route_rules.
 
 graphhopper:
   datareader.file: data/carlisle.osm.pbf
@@ -39,6 +39,11 @@ graphhopper:
     # `run` profile would have excluded it). Not used by the app.
     - name: foot_raw
       custom_model_files: [foot.json]
+    # Diagnostic profile: exclusions ONLY (the Phase 0 model, no preference multipliers).
+    # Baseline for the preference-sanity test — comparing run vs run_noprefs shows the
+    # >1 footway/path multipliers actually change routing. Not used by the app.
+    - name: run_noprefs
+      custom_model_files: [foot.json, run-noprefs.json]
 
   # Flex mode: NO contraction hierarchies (round_trip requires ch.disable=true).
   # Leaving profiles_ch empty keeps the engine in flexible mode.

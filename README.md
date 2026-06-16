@@ -4,9 +4,10 @@ A free, self-hostable tool that generates runnable **loop routes** from a start 
 target distance, avoiding highways and roads over 25 mph. See [`PLAN.md`](./PLAN.md) for the
 full design.
 
-> **Status: Phase 0** — foundation probe + walking skeleton. Proving that GraphHopper's
-> `round_trip` honors the exclusion custom model before any feature work. Phases 1–4 are
-> not built yet.
+> **Status: Phase 1 complete** — full `run` custom model (exclusions + preferences,
+> PLAN.md §3), full `tests/route_rules` enforcement suite (10 tests), and a reachability
+> baseline (`REACHABILITY.md`). Phase 0 (composition probe + walking skeleton) is below.
+> Phases 2–4 (seed-iteration/scoring, elevation chart, surface UI) are not built yet.
 
 ## Stack (Phase 0)
 - **GraphHopper 10.2** as a plain Java JAR (no Docker) — routing + `round_trip` loops.
@@ -35,16 +36,23 @@ scripts/run_backend.sh                # http://localhost:8000
 # Step 1 — trail audit (writes TRAIL_AUDIT.md)
 .venv/bin/python scripts/trail_audit.py
 
-# Step 3 — composition probe (the gate); GraphHopper must be running
+# Composition probe (Phase 0 gate); GraphHopper must be running
 .venv/bin/python tests/route_rules/test_composition_probe.py   # human report
-.venv/bin/python -m pytest tests/route_rules/ -v                # assertions
+
+# Full rule-enforcement suite (Phase 1) — 10 tests
+.venv/bin/python -m pytest tests/route_rules/ -v
+
+# Reachability baseline (Phase 1) -> REACHABILITY.md
+.venv/bin/python scripts/reachability.py
 ```
 
 ## Layout
 | Path | Purpose |
 |---|---|
-| `graphhopper/config.yml` | GraphHopper config — `run` profile (flex, foot base, SRTM) + diagnostic `foot_raw` |
-| `graphhopper/run-profile.json` | Exclusion custom model (no-highway / ≤25 mph) |
+| `graphhopper/config.yml` | GraphHopper config — `run` profile (flex, foot base, SRTM) + diagnostic `foot_raw` / `run_noprefs` |
+| `graphhopper/run-profile.json` | Full `run` custom model — exclusions (no-highway / ≤25 mph) + preferences |
+| `graphhopper/run-noprefs.json` | Exclusions-only model (baseline for the preference-sanity test) |
+| `scripts/reachability.py` | Reachability baseline → `REACHABILITY.md` |
 | `scripts/fetch_data.sh` | Download JAR + PA extract, clip to Carlisle bbox |
 | `scripts/run_graphhopper.sh` | Launch GraphHopper JAR |
 | `scripts/trail_audit.py` | LeTort/borough trail OSM coverage audit → `TRAIL_AUDIT.md` |
