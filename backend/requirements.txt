@@ -2,6 +2,7 @@
 #   python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
 fastapi
 uvicorn[standard]
+httpx
 gpxpy
 requests
 pytest

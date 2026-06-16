@@ -4,10 +4,18 @@ A free, self-hostable tool that generates runnable **loop routes** from a start 
 target distance, avoiding highways and roads over 25 mph. See [`PLAN.md`](./PLAN.md) for the
 full design.
 
-> **Status: Phase 1 complete** — full `run` custom model (exclusions + preferences,
-> PLAN.md §3), full `tests/route_rules` enforcement suite (10 tests), and a reachability
-> baseline (`REACHABILITY.md`). Phase 0 (composition probe + walking skeleton) is below.
-> Phases 2–4 (seed-iteration/scoring, elevation chart, surface UI) are not built yet.
+> **Status: Phase 2 complete** — the real loop generator: N=25 concurrent `round_trip`
+> seeds, distance-dominant (distance-aware) scoring, overlap de-dup, bounded refine, and
+> ranked top-5 output with an honest shortfall flag (`/api/routes`). Phases 0–1 (rules +
+> reachability) are below. Phases 3–4 (elevation chart, candidate-switcher UI, surface
+> preference, saved starts) are not built yet.
+
+## Generator API
+- `GET /api/routes?miles=5&n=25&tolerance=0.08&k=5` → ranked candidates, each with
+  geometry, actual distance, gain, road-mix %, and score breakdown; `shortfall: true` +
+  `message` when no candidate hits tolerance.
+- `GET /api/route?distance_m=8047` → the single best candidate (drives the map UI).
+- `GET /api/gpx?distance_m=<gen_distance_m>&seed=<seed>` → GPX for a chosen candidate.
 
 ## Stack (Phase 0)
 - **GraphHopper 10.2** as a plain Java JAR (no Docker) — routing + `round_trip` loops.
