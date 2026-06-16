@@ -15,7 +15,7 @@ import requests
 from ghclient import (
     EXCLUDED_CLASSES, GH, HOME, SPEED_HI,
     classes_in, max_stored_speed, numeric, overspeed_in,
-    preferred_fraction, route_path, round_trip_path, seg_values,
+    preferred_fraction, route_path, round_trip_path, seg_values, _hav,
 )
 
 
@@ -122,3 +122,37 @@ def test_preference_multipliers_bite():
     assert fr > fn + 0.2, (
         f"preference multipliers did not change routing: run footway/path fraction "
         f"{fr:.3f} vs run_noprefs {fn:.3f}")
+
+
+# --- 7. Dickinson Park internal trails are routable (regression guard) ------------------
+# Confirmed by scripts/dickinson_park_check.py: the park's gravel paths exist in OSM,
+# connect to the street graph (4 access nodes), and the `run` profile cuts through them.
+# This is a POINT-TO-POINT guard (NOT a loop) so a future OSM re-import that drops the
+# park trails fails loudly. Endpoints are two park access nodes on opposite (S/N) sides.
+PARK_BBOX = (40.19800, -77.21723, 40.20183, -77.21007)  # Dickinson Park (leisure=park) S,W,N,E
+CROSS_PARK = ((40.1987845, -77.2168124), (40.2006343, -77.2131354))  # access nodes: S, N
+_PATH_CLASSES = {"footway", "path", "cycleway", "pedestrian"}
+
+
+def _path_meters_in_bbox(path: dict, bb: tuple) -> float:
+    cs = path["points"]["coordinates"]
+    total = 0.0
+    for fr, to, cls in path.get("details", {}).get("road_class", []):
+        if str(cls).lower() not in _PATH_CLASSES:
+            continue
+        for i in range(fr, to):
+            mlat = (cs[i][1] + cs[i + 1][1]) / 2
+            mlon = (cs[i][0] + cs[i + 1][0]) / 2
+            if bb[0] <= mlat <= bb[2] and bb[1] <= mlon <= bb[3]:
+                total += _hav(cs[i], cs[i + 1])
+    return total
+
+
+def test_dickinson_park_trails_routable():
+    a, b = CROSS_PARK
+    run = route_path(a, b, "run")
+    assert run is not None, "run profile could not route across Dickinson Park"
+    meters = _path_meters_in_bbox(run, PARK_BBOX)
+    assert meters > 100, (
+        f"route between the two cross-park access nodes used only {meters:.0f} m of "
+        f"path inside the park bbox — the park trails may have dropped out of OSM/import")
