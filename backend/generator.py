@@ -402,6 +402,20 @@ def _bearing(p, q) -> float:
     return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
 
 
+def project_point(origin_lonlat, bearing_deg: float, dist_m: float) -> list[float]:
+    """Destination [lon, lat] reached by traveling dist_m along bearing_deg from origin
+    (great-circle forward formula). Used to seed a routable turnaround guess for out-and-back
+    generation (backend.outback, backend.milestone)."""
+    R = 6371000.0
+    br = math.radians(bearing_deg)
+    lat1, lon1 = math.radians(origin_lonlat[1]), math.radians(origin_lonlat[0])
+    dr = dist_m / R
+    lat2 = math.asin(math.sin(lat1) * math.cos(dr) + math.cos(lat1) * math.sin(dr) * math.cos(br))
+    lon2 = lon1 + math.atan2(math.sin(br) * math.sin(dr) * math.cos(lat1),
+                             math.cos(dr) - math.sin(lat1) * math.sin(lat2))
+    return [math.degrees(lon2), math.degrees(lat2)]
+
+
 def synthesize_turns(coords: list, turn_threshold_deg: float = 35.0,
                      min_gap_m: float = 30.0) -> list[dict]:
     """Derive a turn list from raw geometry when GraphHopper instructions aren't available

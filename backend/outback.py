@@ -31,6 +31,7 @@ from .generator import (
     _cells,
     _jaccard,
     _make_candidate,
+    project_point,
     surface_custom_model,
 )
 from .milestone import _merge_paths, _reverse_path, _route
@@ -48,19 +49,6 @@ MAX_RETURN = 4
 _INIT_FACTOR = 0.75
 
 
-def _project(origin_lonlat, bearing_deg: float, dist_m: float) -> list[float]:
-    """Destination [lon, lat] reached by traveling dist_m along bearing_deg from origin
-    (great-circle forward formula). Used only to seed a routable turnaround guess."""
-    R = 6371000.0
-    br = math.radians(bearing_deg)
-    lat1, lon1 = math.radians(origin_lonlat[1]), math.radians(origin_lonlat[0])
-    dr = dist_m / R
-    lat2 = math.asin(math.sin(lat1) * math.cos(dr) + math.cos(lat1) * math.sin(dr) * math.cos(br))
-    lon2 = lon1 + math.atan2(math.sin(br) * math.sin(dr) * math.cos(lat1),
-                             math.cos(dr) - math.sin(lat1) * math.sin(lat2))
-    return [math.degrees(lon2), math.degrees(lat2)]
-
-
 async def _one(client: httpx.AsyncClient, start_ll, bearing: float, target_m: float,
                cmodel: dict | None, tolerance: float) -> Candidate | None:
     """Build a single out-and-back toward `bearing`, refining the turnaround toward target.
@@ -74,7 +62,7 @@ async def _one(client: httpx.AsyncClient, start_ll, bearing: float, target_m: fl
     factor = _INIT_FACTOR
     best = None  # (abs distance error fraction, leg) — keep the closest attempt seen
     for _ in range(REFINE_ROUNDS):
-        dest = _project(start_ll, bearing, half * factor)
+        dest = project_point(start_ll, bearing, half * factor)
         leg = await _route(client, [start_ll, dest], cmodel)
         if leg is None:
             return None

@@ -337,11 +337,12 @@ async def milestone_route(payload: dict = Body(...)):
       miles                          (target; ignored when pad=false),
       surface                        ('any'|'paved'|'unpaved'),
       pad                            (true=pad to target, false=derived distance),
+      out_back                       (true=out-and-back retrace through waypoints, not a loop),
       eps_m, tolerance, k            (optional tunables)
     }
     Returns the core candidate shape plus milestone metadata: which method fired
-    (filter/decompose/derived/over_spine), snapped waypoints, D_spine, and the honest
-    over_spine flag when the waypoints are already farther apart than the target.
+    (filter/decompose/derived/out_and_back/over_spine), snapped waypoints, D_spine, and the
+    honest over_spine flag when the waypoints are already farther apart than the target.
     """
     wps = _parse_waypoints(payload)
     lat = float(payload.get("lat", HOME[0]))
@@ -350,6 +351,7 @@ async def milestone_route(payload: dict = Body(...)):
     if surface not in SURFACE_CHOICES:
         raise HTTPException(422, f"surface must be one of {SURFACE_CHOICES}")
     pad = bool(payload.get("pad", True))
+    out_back = bool(payload.get("out_back", False))
     miles = payload.get("miles", None)
     target_m = float(miles) * MI if (pad and miles is not None) else None
     if pad and target_m is None:
@@ -363,7 +365,7 @@ async def milestone_route(payload: dict = Body(...)):
     try:
         result = await milestone_generate(
             start=(lat, lon), waypoints=wps, target_m=target_m, surface=surface,
-            pad=pad, eps_m=eps_m, tolerance=tolerance, k=k)
+            pad=pad, eps_m=eps_m, tolerance=tolerance, k=k, out_back=out_back)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:  # noqa: BLE001

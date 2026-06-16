@@ -112,6 +112,10 @@
             <button data-pad="1" class="active" title="Pad out to the target distance">Pad to target</button>
             <button data-pad="0" title="Just route through the points, report the distance">Exact (derived)</button>
           </div>
+          <div class="presets" id="msShape" style="margin-top:8px">
+            <button data-ob="0" class="active" title="Loop: return by a different route">◯ Loop</button>
+            <button data-ob="1" title="Out &amp; back: run out through the points and retrace the same path home">↩ Out &amp; back</button>
+          </div>
         </div>
 
         <div class="label" style="margin-top:14px">Distance</div>
@@ -182,7 +186,7 @@
 
   let state = { start: HOME.slice(), startName: 'Home', miles: 5, surface: 'any',
                 data: null, sel: -1, layers: [], chart: null, starts: [],
-                mode: 'loops', pad: true, turns: [],
+                mode: 'loops', pad: true, outBack: false, turns: [],
                 waypoints: [], wpMarkers: [], snapMarkers: [], milestones: [] };
 
   const map = L.map('map', { zoomControl: true }).setView(HOME, 14);
@@ -403,11 +407,13 @@
   async function generateMilestone(){
     if(!state.waypoints.length){ setStatus('Drop or type at least one required waypoint.', true); return; }
     const mi = parseFloat(document.getElementById('miles').value); state.miles = mi;
-    setStatus(state.pad ? `Building loops through ${state.waypoints.length} point(s) near ${mi} mi…`
+    const shape = state.outBack ? 'out-and-back route' : 'loop';
+    setStatus(state.pad ? `Building ${shape}s through ${state.waypoints.length} point(s) near ${mi} mi…`
                         : `Routing through ${state.waypoints.length} point(s)…`);
     document.getElementById('cards').innerHTML='';
     const body = { waypoints: state.waypoints.map(w=>({lat:w[0],lon:w[1]})),
-      lat: state.start[0], lon: state.start[1], surface: state.surface, pad: state.pad };
+      lat: state.start[0], lon: state.start[1], surface: state.surface,
+      pad: state.pad, out_back: state.outBack };
     if(state.pad) body.miles = mi;
     try{
       const res = await fetch('/api/milestone', { method:'POST',
@@ -417,10 +423,11 @@
       drawSnapped(d.snapped_waypoints||[]);
       if(d.over_spine){ setStatus('⚠ '+d.message, true); document.getElementById('cards').innerHTML=''; return; }
       const methodNote = { filter:'filtered round-trips', decompose:'built (out-and-back + loop)',
-        derived:'exact route through points' }[d.method] || d.method;
+        derived:'exact route through points', out_and_back:'out-and-back retrace' }[d.method] || d.method;
+      const noun = state.outBack ? 'route' : 'loop';
       const snapNote = (d.snapped_waypoints||[]).some(s=>s.moved) ? ' · some pins snapped to nearest runnable point' : '';
       if(d.shortfall) setStatus(`⚠ ${d.message||'closest available'} — ${methodNote}.${snapNote}`, true);
-      else setStatus(`${d.candidates.length} loop${d.candidates.length!==1?'s':''} through all points · ${methodNote}${snapNote}.`);
+      else setStatus(`${d.candidates.length} ${noun}${d.candidates.length!==1?'s':''} through all points · ${methodNote}${snapNote}.`);
       drawAll(); renderCards();
       if(d.candidates.length) select(0);
     }catch(e){ setStatus('Error: '+e.message, true); }
@@ -626,6 +633,10 @@
   document.querySelectorAll('#msPad button').forEach(b=>{
     b.onclick = ()=>{ document.querySelectorAll('#msPad button').forEach(x=>x.classList.remove('active'));
       b.classList.add('active'); state.pad = b.dataset.pad==='1'; generate(); };
+  });
+  document.querySelectorAll('#msShape button').forEach(b=>{
+    b.onclick = ()=>{ document.querySelectorAll('#msShape button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active'); state.outBack = b.dataset.ob==='1'; generate(); };
   });
   document.getElementById('msAddAddr').onclick = addWaypointByAddr;
   document.getElementById('msAddr').addEventListener('keydown', e=>{ if(e.key==='Enter') addWaypointByAddr(); });

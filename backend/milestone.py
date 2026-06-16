@@ -45,6 +45,7 @@ from .generator import (
     _jaccard,
     _make_candidate,
     _serialize,
+    project_point,
     score_candidate,
     surface_custom_model,
 )
@@ -206,17 +207,109 @@ def _dedup_topk(cands: list[Candidate], k: int, overlap_threshold: float = 0.6) 
     return out
 
 
+# ------------------------------------------------------------------- out-and-back through wps
+# Bearings tried when extending PAST the last waypoint to pad an out-and-back to target.
+OB_BEARINGS = 8
+OB_REFINE = 4
+
+
+async def _out_and_back(client: httpx.AsyncClient, start_ll, wp_ll, snapped_wp_ll,
+                        target_m: float | None, cmodel: dict | None, tolerance: float,
+                        eps_m: float, k: int) -> list[Candidate]:
+    """Build out-and-back routes that go OUT through every waypoint (in order) and retrace the
+    EXACT same path home. A true retrace — distinct from the loops the filter/decompose paths
+    return — so a runner can hit known points and come straight back.
+
+    target_m is None (derived) → the plain there-and-back: route start→wp₁→…→wp_L, reverse it.
+    target_m set (pad)         → if the plain retrace is short of target, EXTEND past the last
+                                 waypoint to a turnaround sized so the round trip ≈ target, then
+                                 retrace from there. Several bearings give distinct options.
+
+    Every leg routes on profile=run, so the safety model governs the whole route; each result
+    is re-checked to pass within ε of every waypoint (the out leg guarantees it by construction).
+    """
+    out = await _route(client, [start_ll, *wp_ll], cmodel)  # one-way spine through the wps
+    if out is None:
+        return []
+    d_out = float(out.get("distance", 0.0))
+
+    # Derived, or padding budget too small to bother extending: the plain there-and-back.
+    plain_extra = (target_m is not None) and (target_m - 2 * d_out >= MIN_PAD_M)
+    cands: list[Candidate] = []
+    if target_m is None or not plain_extra:
+        merged = _merge_paths([out, _reverse_path(out)])
+        c = _make_candidate(seed=0, gen_distance_m=int(round(2 * d_out)), path=merged)
+        if passes_through(c.coords, snapped_wp_ll, eps_m):
+            _tag_out_and_back(c, out, _reverse_path(out))
+            cands.append(c)
+        return cands
+
+    # Pad: extend past the last waypoint along several bearings to a turnaround, retrace whole.
+    anchor = snapped_wp_ll[-1]
+    half_extra = (target_m - 2 * d_out) / 2.0  # one-way extra distance beyond the last wp
+    bearings = [i * 360.0 / OB_BEARINGS for i in range(OB_BEARINGS)]
+
+    async def _leg(bearing: float):
+        factor = 0.75
+        best = None
+        for _ in range(OB_REFINE):
+            dest = project_point(anchor, bearing, max(half_extra, 1.0) * factor)
+            ext = await _route(client, [anchor, dest], cmodel)
+            if ext is None:
+                return None
+            ext_m = float(ext.get("distance", 0.0))
+            if ext_m <= 0:
+                return None
+            total = 2 * (d_out + ext_m)
+            err = abs(total - target_m) / target_m
+            if best is None or err < best[0]:
+                best = (err, ext)
+            if err <= tolerance:
+                break
+            factor *= max(half_extra, 1.0) / ext_m
+            factor = max(0.2, min(factor, 1.6))
+        if best is None or best[0] > max(tolerance, 0.12):
+            return None
+        ext = best[1]
+        # Full out path = spine to last wp, then the extension; retrace the whole thing.
+        out_full = _merge_paths([out, ext])
+        back_full = _reverse_path(out_full)
+        merged = _merge_paths([out_full, back_full])
+        c = _make_candidate(seed=2_000_000 + int(round(bearing)),
+                            gen_distance_m=int(round(target_m)), path=merged)
+        if not passes_through(c.coords, snapped_wp_ll, eps_m):
+            return None
+        _tag_out_and_back(c, out_full, back_full)
+        return c
+
+    built = await asyncio.gather(*[_leg(b) for b in bearings])
+    return _dedup_topk([c for c in built if c is not None], k)
+
+
+def _tag_out_and_back(c: Candidate, out_path: dict, back_path: dict) -> None:
+    """Flag a candidate as a retraced out-and-back and record its retrace overlap (≈100%)."""
+    c.route_type = "out_and_back"
+    c.overlap_pct = 100.0 * _jaccard(_cells(out_path["points"]["coordinates"]),
+                                     _cells(back_path["points"]["coordinates"]))
+
+
 # --------------------------------------------------------------------------- orchestrator
 async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None,
                     surface: str = "any", pad: bool = True, eps_m: float = EPS_M,
                     n: int = FILTER_N, tolerance: float = 0.08, k: int = 5,
-                    filter_min: int = FILTER_MIN_CANDIDATES) -> dict:
-    """Generate loops through every waypoint, padded to target_m (or derived if pad=False).
+                    filter_min: int = FILTER_MIN_CANDIDATES,
+                    out_back: bool = False) -> dict:
+    """Generate routes through every waypoint, padded to target_m (or derived if pad=False).
 
     start, waypoints: (lat, lon) tuples (UI/geocoder order). Internally we work in [lon,lat].
     pad=False  → "exact-waypoints, derived-distance": route through the points and report
                  whatever distance results (target_m ignored). Same machinery, no padding.
     pad=True   → pad UP to target_m within tolerance via FILTER, else DECOMPOSE.
+    out_back   → build pure OUT-AND-BACK routes that run out through every waypoint and retrace
+                 the same path home (a true retrace), instead of loops. Honors pad: a derived
+                 out-and-back is the plain there-and-back; a padded one extends past the last
+                 waypoint to hit the target. Falls back to loop generation if no out-and-back
+                 can be built (e.g. the retrace already overshoots the target).
 
     Returns the core candidate shape plus milestone metadata: snapped waypoints (with a
     moved flag so the UI can explain snapping), the method that fired, D_spine, and the
@@ -261,6 +354,27 @@ async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None
             "eps_m": eps_m,
             "filter_threshold": filter_min,
         }
+
+        # --- out-and-back: run OUT through the waypoints and retrace home (a true retrace),
+        # honoring pad. Built first when requested; falls back to loop logic if none emerge.
+        if out_back:
+            ob_target = target_m if (pad and target_m is not None) else None
+            ob = await _out_and_back(client, start_ll, wp_ll, snapped_wp_ll, ob_target,
+                                     cmodel, tolerance, eps_m, k)
+            if ob:
+                ref = (target_m if ob_target is not None else ob[0].distance_m) or 1.0
+                for c in ob:
+                    score_candidate(c, ref, ref / MI)
+                ob = _dedup_topk(ob, k)
+                best_err = min((c.breakdown["distance_err"] for c in ob), default=0.0)
+                shortfall = (ob_target is not None) and best_err > tolerance
+                return {**meta, "method": "out_and_back", "pad": bool(pad and target_m is not None),
+                        "over_spine": False, "shortfall": shortfall,
+                        "target_mi": round(target_m / MI, 2) if target_m else None,
+                        "message": (f"closest out-and-back was {ob[0].distance_mi:.2f} mi"
+                                    if shortfall else None),
+                        "candidates": [_serialize(c, r) for r, c in enumerate(ob, 1)]}
+            # else: no out-and-back could be built — fall through to the loop paths below.
 
         # --- pad=False: derived distance — the spine through the waypoints, as-is.
         if not pad or target_m is None:

@@ -193,3 +193,29 @@ def test_derived_distance_mode_routes_through_points():
     assert min_dist_to_polyline_m(_snapped_ll(r)[0], _coords_lonlat(c)) <= EPS_M + 1
     # derived distance should be ~the spine length, not padded to any target
     assert abs(c["distance_mi"] - r["d_spine_mi"]) < 0.05
+
+
+# --------------------------------------------------------------- out-and-back (retrace)
+def test_out_and_back_padded_is_retraced_and_includes_waypoint():
+    r = _run(milestone(HOME, [FIELDS], 6 * MI, out_back=True, k=4))
+    assert r["method"] == "out_and_back"
+    assert r["candidates"], "should build at least one padded out-and-back"
+    swll = _snapped_ll(r)
+    for c in r["candidates"]:
+        assert c["route_type"] == "out_and_back"
+        assert c["overlap_pct"] >= 70.0, f"only {c['overlap_pct']:.0f}% retraced — not a real retrace"
+        assert min_dist_to_polyline_m(swll[0], _coords_lonlat(c)) <= EPS_M + 1
+        assert abs(c["distance_mi"] - 6.0) / 6.0 <= 0.12
+        # the carried-over safety model still governs every leg of the retrace
+        assert not (set(c["road_mix_pct"].keys()) & EXCLUDED_CLASSES)
+
+
+def test_out_and_back_derived_is_plain_there_and_back():
+    r = _run(milestone(HOME, [FIELDS], None, pad=False, out_back=True))
+    assert r["method"] == "out_and_back"
+    assert len(r["candidates"]) == 1
+    c = r["candidates"][0]
+    assert c["route_type"] == "out_and_back"
+    assert c["overlap_pct"] >= 70.0
+    # a there-and-back is ~twice the one-way spine to the single waypoint
+    assert min_dist_to_polyline_m(_snapped_ll(r)[0], _coords_lonlat(c)) <= EPS_M + 1
