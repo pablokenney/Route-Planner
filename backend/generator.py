@@ -48,6 +48,48 @@ def expected_lastresort_frac(target_mi: float) -> float:
     return _EXP_LO_FRAC + t * (_EXP_HI_FRAC - _EXP_LO_FRAC)
 
 
+# --------------------------------------------------------------- surface preference (§Phase 4)
+# Soft surface steer as a PER-REQUEST custom model. Legal because the server runs pure flex
+# (profiles_ch/profiles_lm empty), where GraphHopper permits multiply_by > 1 per request and
+# merges this priority block on TOP of the server-side `run` exclusions — so the no-highway /
+# >45 km/h hard-excludes stay absolute regardless of surface choice (PLAN.md §3).
+#
+# Buckets use GraphHopper's `surface` EncodedValue enum (v10). Anything not named here
+# (OTHER, MISSING, COBBLESTONE, WOOD, …) stays NEUTRAL — untagged streets are never demoted,
+# mirroring the "never gate residential on a tag" principle of the speed rules.
+_SURFACE_PAVED = ("PAVED", "ASPHALT", "CONCRETE", "PAVING_STONES")
+_SURFACE_UNPAVED = ("UNPAVED", "COMPACTED", "FINE_GRAVEL", "GRAVEL", "GROUND", "DIRT", "GRASS", "SAND")
+
+# "Gentle nudge" strength (the chosen Phase 4 setting): prefer ×1.4, demote ×0.6. Distance
+# accuracy still dominates ranking; surface only reshapes among otherwise-comparable loops.
+_SURFACE_PREFER = "1.4"
+_SURFACE_DEMOTE = "0.6"
+
+SURFACE_CHOICES = ("any", "paved", "unpaved")
+
+
+def surface_custom_model(surface: str) -> dict | None:
+    """Per-request custom model for a surface preference, or None for 'any' (no preference).
+
+    Returned shape is GraphHopper's flex custom_model: a `priority` list of multiply_by
+    statements that GH appends to the profile model. Order within the list is immaterial
+    here (the prefer/demote sets are disjoint), and none of these multipliers can un-exclude
+    an edge the profile already zeroed.
+    """
+    surface = (surface or "any").lower()
+    if surface == "any":
+        return None
+    if surface == "paved":
+        prefer, demote = _SURFACE_PAVED, _SURFACE_UNPAVED
+    elif surface == "unpaved":
+        prefer, demote = _SURFACE_UNPAVED, _SURFACE_PAVED
+    else:
+        raise ValueError(f"unknown surface preference {surface!r} (use one of {SURFACE_CHOICES})")
+    priority = [{"if": f"surface == {s}", "multiply_by": _SURFACE_PREFER} for s in prefer]
+    priority += [{"if": f"surface == {s}", "multiply_by": _SURFACE_DEMOTE} for s in demote]
+    return {"priority": priority}
+
+
 # ----------------------------------------------------------------------------- geometry
 def _hav(p, q) -> float:
     R = 6371000.0
@@ -136,14 +178,41 @@ def score_candidate(c: Candidate, target_m: float, target_mi: float) -> None:
 
 
 # --------------------------------------------------------------------------- GH calls
-async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int, start):
+def round_trip_body(seed: int, gen_distance_m: int, start, custom_model: dict | None,
+                    heading: float | None = None) -> dict:
+    """POST body for a single round_trip. POST (not GET) is required so a per-request
+    `custom_model` (the surface preference) can ride along. Note GH POST uses [lon, lat].
+
+    heading (optional, degrees 0-360 clockwise from north): biases which way the first leg
+    leaves `start`. Additive only — default None reproduces the prior body exactly. Phase 5
+    milestone mode uses it to steer seeds toward a waypoint bearing and lift filter yield;
+    it changes no rule, multiplier, or scoring, just which direction a seed explores.
+    """
+    body: dict = {
+        "points": [[start[1], start[0]]],
+        "profile": "run",
+        "algorithm": "round_trip",
+        "round_trip.distance": gen_distance_m,
+        "round_trip.seed": seed,
+        "ch.disable": True,
+        "elevation": True,
+        "points_encoded": False,
+        "instructions": False,
+        "details": ["road_class"],
+    }
+    if heading is not None:
+        body["headings"] = [round(heading) % 360]
+    if custom_model is not None:
+        body["custom_model"] = custom_model
+    return body
+
+
+async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int, start,
+                      custom_model: dict | None = None, heading: float | None = None):
     try:
-        r = await client.get(f"{GH}/route", params={
-            "point": f"{start[0]},{start[1]}", "profile": "run", "algorithm": "round_trip",
-            "round_trip.distance": gen_distance_m, "round_trip.seed": seed,
-            "ch.disable": "true", "elevation": "true", "points_encoded": "false",
-            "instructions": "false", "details": "road_class",
-        })
+        r = await client.post(
+            f"{GH}/route",
+            json=round_trip_body(seed, gen_distance_m, start, custom_model, heading))
     except httpx.HTTPError:
         return None
     if r.status_code != 200:
@@ -152,9 +221,11 @@ async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int,
     return _make_candidate(seed, gen_distance_m, paths[0]) if paths else None
 
 
-async def _fire(client, jobs: list[tuple[int, int]], start) -> list[Candidate]:
+async def _fire(client, jobs: list[tuple[int, int]], start,
+                custom_model: dict | None = None, heading: float | None = None) -> list[Candidate]:
     """jobs = [(seed, gen_distance_m), ...] fired concurrently from `start`."""
-    results = await asyncio.gather(*[_round_trip(client, s, d, start) for s, d in jobs])
+    results = await asyncio.gather(
+        *[_round_trip(client, s, d, start, custom_model, heading) for s, d in jobs])
     return [c for c in results if c is not None]
 
 
@@ -162,21 +233,28 @@ async def _fire(client, jobs: list[tuple[int, int]], start) -> list[Candidate]:
 async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
                    k: int = 5, refine_rounds: int = 3,
                    overlap_threshold: float = 0.6, rng_seed: int | None = None,
-                   start: tuple = HOME, display_band: float = 0.12) -> dict:
+                   start: tuple = HOME, display_band: float = 0.12,
+                   surface: str = "any") -> dict:
     """Return ranked, de-duplicated top-k candidate loops for target_m meters from `start`.
 
     display_band (presentation only — NOT scoring): only loops whose distance is within
     this fraction of target are surfaced, so the UI never shows gross padding (e.g. a
     7-mi loop for a 5-mi request). If NOTHING is in-band, fall back to the closest
     achievable so the response is never empty, and the honest shortfall flag still fires.
+
+    surface ('any'|'paved'|'unpaved'): soft per-request preference applied at GENERATION
+    time so the candidate set is reshaped by surface (see surface_custom_model). It is NOT
+    re-scored here — distance still dominates ranking; surface only changes which loops GH
+    proposes. The chosen surface is echoed back so GPX reproduction can rebuild the model.
     """
     target_mi = target_m / MI
+    cmodel = surface_custom_model(surface)
     rng = random.Random(rng_seed)
     seeds = rng.sample(range(1, 10_000_000), n)
 
     async with httpx.AsyncClient(timeout=60.0,
                                  limits=httpx.Limits(max_connections=max(n, 32))) as client:
-        pool = await _fire(client, [(s, int(target_m)) for s in seeds], start)
+        pool = await _fire(client, [(s, int(target_m)) for s in seeds], start, cmodel)
 
         # Bounded refine: for the best-by-distance seeds not yet in tolerance, re-fire with
         # round_trip.distance nudged by target/actual. Stop early once within tolerance.
@@ -196,7 +274,7 @@ async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
                 jobs.append((c.seed, nudged))
             if not jobs:
                 break
-            pool.extend(await _fire(client, jobs, start))
+            pool.extend(await _fire(client, jobs, start, cmodel))
 
     for c in pool:
         score_candidate(c, target_m, target_mi)
@@ -222,6 +300,7 @@ async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
         "target_m": round(target_m, 1),
         "tolerance": tolerance,
         "display_band": display_band,
+        "surface": (surface or "any").lower(),
         "n": n,
         "pool_size": len(pool),
         "shortfall": shortfall,

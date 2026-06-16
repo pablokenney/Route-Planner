@@ -1,7 +1,8 @@
 # Plan: Self-Hosted Running-Route Loop Generator (rev. 2)
 
-> In-repo source of truth for the design. Phase 0 is being built first as a foundation
-> probe. Do not build Phases 1–4 until Phase 0's milestone is hit and reviewed.
+> In-repo source of truth for the design. **Phases 0–5 are complete** — see the per-phase
+> status in §6. Phase 0 was built first as a foundation probe (GraphHopper GO). Phase 5.1
+> (segment-anchoring) is the next planned step and is NOT yet built.
 
 ## Context
 
@@ -99,18 +100,52 @@ runs in Phase 0/1 (`scripts/trail_audit.py` → `TRAIL_AUDIT.md`). Resolution fo
 prefer "lollipop" out-and-back on the trail over admitting fast tertiary/unclassified.
 
 ## 6. Phased Build Plan
-- **Phase 0 (current):** composition probe + walking skeleton. Prove `round_trip` honors
+- **Phase 0 (done):** composition probe + walking skeleton. Prove `round_trip` honors
   the exclusion model; one constraint-respecting loop on a map + GPX. STOP at milestone.
-- **Phase 1:** full custom model + `tests/route_rules` + trail audit.
-- **Phase 2:** real loop generator (seed-iteration + scoring).
-- **Phase 3:** elevation profile + UI.
-- **Phase 4:** surface preference + saved starts + caching.
+- **Phase 1 (done):** full custom model + `tests/route_rules` + trail audit.
+- **Phase 2 (done):** real loop generator (seed-iteration + scoring).
+- **Phase 3 (done):** elevation profile + UI.
+- **Phase 4 (done):** surface preference + saved starts + caching.
+  - *Surface:* soft, default "any". Implemented as a **per-request custom model**
+    (`backend/generator.surface_custom_model`) — legal under pure flex, where `multiply_by
+    > 1` is allowed per-request and GH merges it on top of the `run` exclusions, so the
+    no-highway / ≤25 mph hard rules stay absolute. Gentle strength (prefer ×1.4, demote
+    ×0.6); untagged surfaces stay neutral. Threaded through generation AND GPX reproduction
+    (round_trip switched GET→POST so the model rides in the body; GPX must reuse the same
+    model or geometry drifts from the chosen candidate).
+  - *Saved starts:* server-side `starts.json` (upsert by name), `GET/POST /api/starts`,
+    `DELETE /api/starts/{name}`.
+  - *Caching:* in-memory TTL cache on `/api/routes` keyed on the candidate-set inputs
+    (start rounded to ~11 m, distance, surface, n, tol, k); `fresh=true` bypasses.
+- **Phase 5 (done):** Milestone Mode — exact waypoints, padded distance. Built strictly ON
+  TOP of the locked engine (`backend/milestone.py` reuses the generator's `_fire`,
+  `_make_candidate`, `score_candidate`, `_serialize`, de-dup; no rule/multiplier/round_trip
+  change). Every leg routes on `profile=run`, so the full safety model governs all of it.
+  - *Two mechanisms, chosen by yield:* FILTER (primary) fires the unchanged round_trip
+    fan-out at the target, biased toward the first waypoint via `headings`, and keeps loops
+    passing within ε of every waypoint. DECOMPOSE (fallback) guarantees inclusion by
+    construction: spine start→wp₁→…→wp_L, a round_trip anchored at wp_L sized to the
+    remaining budget, then the spine reversed; pad-loop seed variation recovers variety
+    (round_trip cannot combine with GH's alternative_route algorithm).
+  - *Trigger (tunable):* `FILTER_MIN_CANDIDATES = 3` DISTINCT in-tolerance filtered loops to
+    prefer the filter; below that → decompose. *ε = 40 m* (`EPS_M`) — a waypoint snaps onto a
+    runnable edge, and a loop traversing that edge passes within metres.
+  - *Empirical finding:* for single-point anchors the filter almost always yields 0–1
+    *distinct* loops (forcing a loop through a fixed point collapses shape variety), so
+    decomposition fires in practice. It still delivers ~5 varied loops at ~1.9% mean
+    distance error (Dickinson fields → 6 mi, 8 runs, 100% waypoint inclusion).
+  - *Snapping:* a pin on an excluded road snaps to the nearest RUNNABLE edge (never the
+    excluded one) — proven by run-vs-foot_raw snapping in the tests. Reported to the UI.
+  - *Over-spine (the one hard failure):* D_spine > target·(1+tol) is unsatisfiable (can't
+    pad down); reported honestly, never by dropping a waypoint.
+  - *Modes:* `pad=true` pads to target; `pad=false` → exact-waypoints, derived-distance
+    (the spine itself). Saved milestones persist to `milestones.json` (Phase 4 pattern).
+  - *NOT built (Phase 5.1):* segment-anchoring (forcing a known sub-route/edge sequence).
 
 ## Critical files
 - `scripts/run_graphhopper.sh` — launch GraphHopper JAR (no docker-compose on this machine).
 - `graphhopper/config.yml`, `graphhopper/run-profile.json` — encoded values, flex, §3 model.
-- `backend/` — `main.py`, `loop_generator.py`, `scoring.py`, `gpx.py`, `geocode.py`,
-  `postfilter.py`.
+- `backend/` — `main.py`, `generator.py`, `milestone.py` (Phase 5).
 - `frontend/` — Leaflet map, controls, elevation chart, candidate switcher, GPX download.
 - `tests/route_rules/` — rule + composition + accuracy tests.
 - `scripts/trail_audit.py` — LeTort/borough OSM coverage check (§5a).

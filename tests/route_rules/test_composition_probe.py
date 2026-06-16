@@ -166,6 +166,21 @@ def report() -> dict:
 
 
 # ------------------------------------------------------------------------------ pytest
+def _gh_up() -> bool:
+    try:
+        return requests.get(f"{GH}/info", timeout=3).status_code == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Skip (don't error) under pytest when GraphHopper isn't running — matches the guard in
+# test_rule_enforcement.py and test_generator.py. The __main__ script path below is
+# unaffected and still runs the full Phase 0 report against a live server.
+import pytest  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not _gh_up(), reason="GraphHopper not running on :8989")
+
+
 def test_no_excluded_road_classes():
     res = analyze()
     assert not res["violating_classes"], f"excluded classes present: {res['violating_classes']}"

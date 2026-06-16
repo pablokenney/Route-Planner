@@ -33,6 +33,14 @@
     .presets button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     .row { display:flex; gap:8px; align-items:center; margin-top:8px; }
     .label { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    .starts { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; min-height:8px; }
+    .starts .chip { display:flex; align-items:center; gap:5px; background:var(--panel2);
+                    border:1px solid var(--line); border-radius:14px; padding:3px 6px 3px 10px;
+                    font-size:12px; cursor:pointer; }
+    .starts .chip:hover { border-color:var(--accent2); }
+    .starts .chip .x { color:var(--muted); font-weight:700; padding:0 3px; border-radius:8px; }
+    .starts .chip .x:hover { color:#f87171; }
+    .starts .empty { font-size:12px; color:var(--muted); }
     #status { padding:8px 16px; font-size:12px; color:var(--muted); min-height:32px; }
     #status.warn { color:#fbbf24; }
     .cards { flex:1; overflow-y:auto; padding:6px 12px 14px; }
@@ -72,7 +80,29 @@
   <div class="main">
     <aside class="sidebar">
       <div class="controls">
-        <div class="label">Distance</div>
+        <div class="presets" id="mode">
+          <button data-mode="loops" class="active">Loops</button>
+          <button data-mode="milestone" title="Loops through points you require">Milestone</button>
+        </div>
+
+        <!-- Milestone-only: required waypoints -->
+        <div id="msBlock" style="display:none">
+          <div class="label" style="margin-top:14px">Required waypoints</div>
+          <div id="msHint" class="mixtext" style="margin:6px 0">
+            Click the map to drop a pin, or type an address below. Every loop will pass through each point.
+          </div>
+          <div id="msWaypoints" class="starts"></div>
+          <div class="row">
+            <input id="msAddr" type="text" placeholder="Add a waypoint by address" style="flex:1;width:auto" />
+            <button id="msAddAddr" class="ghost">Add</button>
+          </div>
+          <div class="presets" id="msPad" style="margin-top:10px">
+            <button data-pad="1" class="active" title="Pad out to the target distance">Pad to target</button>
+            <button data-pad="0" title="Just route through the points, report the distance">Exact (derived)</button>
+          </div>
+        </div>
+
+        <div class="label" style="margin-top:14px">Distance</div>
         <div class="presets" id="presets">
           <button data-mi="3">3 mi</button>
           <button data-mi="5">5 mi</button>
@@ -83,6 +113,29 @@
           <input id="miles" type="number" value="5" step="0.1" min="0.6" max="15" />
           <span class="label">miles</span>
           <button id="go" style="margin-left:auto">Generate loops</button>
+        </div>
+
+        <div class="label" style="margin-top:14px">Surface</div>
+        <div class="presets" id="surface">
+          <button data-surf="any" class="active" title="No preference">Any</button>
+          <button data-surf="paved" title="Prefer paved/asphalt">Paved</button>
+          <button data-surf="unpaved" title="Prefer trails/unpaved">Unpaved</button>
+        </div>
+
+        <div class="label" style="margin-top:14px"><span id="savedLabel">Saved starts</span></div>
+        <div id="starts" class="starts"></div>
+        <div class="row">
+          <input id="startNameInput" type="text" placeholder="Name this start" style="flex:1;width:auto" />
+          <button id="saveStart" class="ghost">Save current</button>
+        </div>
+        <!-- Milestone-only: saved milestones -->
+        <div id="msSavedBlock" style="display:none">
+          <div class="label" style="margin-top:14px">Saved milestones</div>
+          <div id="msSaved" class="starts"></div>
+          <div class="row">
+            <input id="msNameInput" type="text" placeholder="Name this milestone" style="flex:1;width:auto" />
+            <button id="msSave" class="ghost">Save current</button>
+          </div>
         </div>
       </div>
       <div id="status">Pick a distance and generate.</div>
@@ -108,13 +161,21 @@
     tertiary:'#f87171', unclassified:'#fb923c', road:'#fb923c', track:'#a3a3a3',
     steps:'#9ca3af', other:'#cbd5e1' };
 
-  let state = { start: HOME.slice(), startName: 'Home', miles: 5,
-                data: null, sel: -1, layers: [], chart: null };
+  let state = { start: HOME.slice(), startName: 'Home', miles: 5, surface: 'any',
+                data: null, sel: -1, layers: [], chart: null, starts: [],
+                mode: 'loops', pad: true,
+                waypoints: [], wpMarkers: [], snapMarkers: [], milestones: [] };
 
   const map = L.map('map', { zoomControl: true }).setView(HOME, 14);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
     { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
   let startMarker = L.marker(HOME, { title: 'Start' }).addTo(map);
+
+  // Distinct icons for required (requested) vs snapped waypoint positions.
+  function dot(color){ return L.divIcon({ className:'', iconSize:[16,16], iconAnchor:[8,8],
+    html:`<div style="width:14px;height:14px;border-radius:50%;background:${color};
+          border:2px solid #0f172a;box-shadow:0 0 0 1px ${color}"></div>` }); }
+  const WP_ICON = dot('#f59e0b'), SNAP_ICON = dot('#34d399');
 
   function setStatus(msg, warn=false){ const s=document.getElementById('status');
     s.textContent=msg; s.className = warn ? 'warn' : ''; }
@@ -175,7 +236,28 @@
     renderChart(state.data.candidates[i]);
     const c = state.data.candidates[i];
     const dl = document.getElementById('dlbtn');
-    dl.href = `/api/gpx?distance_m=${c.gen_distance_m}&seed=${c.seed}&lat=${state.start[0]}&lon=${state.start[1]}`;
+    if(state.mode==='milestone'){
+      // Milestone candidates (esp. decomposed composites) can't be reproduced by a single
+      // round_trip, so download GPX straight from the geometry we already hold.
+      dl.onclick = (e)=>{ e.preventDefault(); downloadTrack(c); };
+      dl.removeAttribute('href');
+    } else {
+      dl.onclick = null;
+      dl.href = `/api/gpx?distance_m=${c.gen_distance_m}&seed=${c.seed}&lat=${state.start[0]}&lon=${state.start[1]}&surface=${state.surface}`;
+    }
+  }
+
+  // POST geometry to /api/gpx_track and trigger a download (used in milestone mode).
+  async function downloadTrack(c){
+    try{
+      const r = await fetch('/api/gpx_track', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ latlngs:c.latlngs, elevations:c.elevations,
+          name:`Milestone ${c.distance_mi.toFixed(1)}mi` }) });
+      if(!r.ok){ setStatus('GPX error: '+(await r.text()), true); return; }
+      const blob = await r.blob(); const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href=url; a.download=`milestone_${c.distance_mi.toFixed(1)}mi.gpx`;
+      a.click(); URL.revokeObjectURL(url);
+    }catch(e){ setStatus('GPX error: '+e.message, true); }
   }
 
   function renderChart(c){
@@ -204,18 +286,47 @@
     else state.chart = new Chart(document.getElementById('elev'), cfg);
   }
 
-  async function generate(){
+  function generate(){ return state.mode==='milestone' ? generateMilestone() : generateLoops(); }
+
+  async function generateLoops(){
     setStatus('Generating loops…');
     document.getElementById('cards').innerHTML='';
     const mi = parseFloat(document.getElementById('miles').value);
     state.miles = mi;
     try{
-      const u = `/api/routes?miles=${mi}&lat=${state.start[0]}&lon=${state.start[1]}`;
+      const u = `/api/routes?miles=${mi}&lat=${state.start[0]}&lon=${state.start[1]}&surface=${state.surface}`;
       const res = await fetch(u);
       if(!res.ok){ setStatus('Error: '+(await res.text()), true); return; }
       const d = await res.json(); state.data = d; state.sel=-1;
+      const surfNote = d.surface && d.surface!=='any' ? ` · ${d.surface}` : '';
       if(d.shortfall) setStatus(`⚠ ${d.message} — showing closest available.`, true);
-      else setStatus(`${d.candidates.length} loop${d.candidates.length>1?'s':''} near ${mi} mi (within ±${Math.round(d.display_band*100)}%).`);
+      else setStatus(`${d.candidates.length} loop${d.candidates.length>1?'s':''} near ${mi} mi (within ±${Math.round(d.display_band*100)}%)${surfNote}.`);
+      drawAll(); renderCards();
+      if(d.candidates.length) select(0);
+    }catch(e){ setStatus('Error: '+e.message, true); }
+  }
+
+  async function generateMilestone(){
+    if(!state.waypoints.length){ setStatus('Drop or type at least one required waypoint.', true); return; }
+    const mi = parseFloat(document.getElementById('miles').value); state.miles = mi;
+    setStatus(state.pad ? `Building loops through ${state.waypoints.length} point(s) near ${mi} mi…`
+                        : `Routing through ${state.waypoints.length} point(s)…`);
+    document.getElementById('cards').innerHTML='';
+    const body = { waypoints: state.waypoints.map(w=>({lat:w[0],lon:w[1]})),
+      lat: state.start[0], lon: state.start[1], surface: state.surface, pad: state.pad };
+    if(state.pad) body.miles = mi;
+    try{
+      const res = await fetch('/api/milestone', { method:'POST',
+        headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      if(!res.ok){ setStatus('Error: '+(await res.text()), true); return; }
+      const d = await res.json(); state.data = d; state.sel=-1;
+      drawSnapped(d.snapped_waypoints||[]);
+      if(d.over_spine){ setStatus('⚠ '+d.message, true); document.getElementById('cards').innerHTML=''; return; }
+      const methodNote = { filter:'filtered round-trips', decompose:'built (out-and-back + loop)',
+        derived:'exact route through points' }[d.method] || d.method;
+      const snapNote = (d.snapped_waypoints||[]).some(s=>s.moved) ? ' · some pins snapped to nearest runnable point' : '';
+      if(d.shortfall) setStatus(`⚠ ${d.message||'closest available'} — ${methodNote}.${snapNote}`, true);
+      else setStatus(`${d.candidates.length} loop${d.candidates.length!==1?'s':''} through all points · ${methodNote}${snapNote}.`);
       drawAll(); renderCards();
       if(d.candidates.length) select(0);
     }catch(e){ setStatus('Error: '+e.message, true); }
@@ -242,6 +353,143 @@
     startMarker.setLatLng(HOME); map.setView(HOME,14); generate();
   }
 
+  // ---- saved start points (server-side starts.json) ----
+  function applyStart(lat, lon, name){
+    state.start=[lat,lon]; state.startName=name;
+    document.getElementById('startName').textContent = '📍 '+name;
+    startMarker.setLatLng(state.start); map.setView(state.start, 14);
+    generate();
+  }
+  function renderStarts(){
+    const wrap = document.getElementById('starts'); wrap.innerHTML='';
+    if(!state.starts.length){ wrap.innerHTML='<span class="empty">None saved yet.</span>'; return; }
+    state.starts.forEach(s=>{
+      const chip = document.createElement('span'); chip.className='chip';
+      chip.innerHTML = `<span class="nm">${s.name}</span><span class="x" title="Delete">✕</span>`;
+      chip.querySelector('.nm').onclick = ()=>applyStart(s.lat, s.lon, s.name);
+      chip.querySelector('.x').onclick = (e)=>{ e.stopPropagation(); deleteStart(s.name); };
+      wrap.appendChild(chip);
+    });
+  }
+  async function loadStarts(){
+    try{ const r = await fetch('/api/starts'); if(r.ok){ state.starts = await r.json(); renderStarts(); } }
+    catch(e){ /* non-fatal */ }
+  }
+  async function saveStart(){
+    const inp = document.getElementById('startNameInput');
+    const name = inp.value.trim() || state.startName;
+    if(!name){ setStatus('Give this start a name first.', true); return; }
+    try{
+      const r = await fetch('/api/starts', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name, lat: state.start[0], lon: state.start[1] }) });
+      if(!r.ok){ setStatus('Could not save start: '+(await r.text()), true); return; }
+      state.starts = await r.json(); inp.value=''; renderStarts();
+      setStatus(`Saved start "${name}".`);
+    }catch(e){ setStatus('Save error: '+e.message, true); }
+  }
+  async function deleteStart(name){
+    try{
+      const r = await fetch('/api/starts/'+encodeURIComponent(name), { method:'DELETE' });
+      if(r.ok){ state.starts = await r.json(); renderStarts(); }
+    }catch(e){ /* non-fatal */ }
+  }
+
+  // ---- milestone: required waypoints ----
+  function renderWaypoints(){
+    const wrap = document.getElementById('msWaypoints'); wrap.innerHTML='';
+    if(!state.waypoints.length){ wrap.innerHTML='<span class="empty">No waypoints yet.</span>'; return; }
+    state.waypoints.forEach((w,i)=>{
+      const chip = document.createElement('span'); chip.className='chip';
+      chip.innerHTML = `<span class="nm">📍 ${w.label||('Point '+(i+1))}</span><span class="x" title="Remove">✕</span>`;
+      chip.querySelector('.x').onclick = (e)=>{ e.stopPropagation(); removeWaypoint(i); };
+      wrap.appendChild(chip);
+    });
+  }
+  function drawWpMarkers(){
+    state.wpMarkers.forEach(m=>map.removeLayer(m)); state.wpMarkers=[];
+    state.waypoints.forEach(w=>{ const m=L.marker([w[0],w[1]],{icon:WP_ICON}).addTo(map);
+      state.wpMarkers.push(m); });
+  }
+  function drawSnapped(snapped){
+    state.snapMarkers.forEach(m=>map.removeLayer(m)); state.snapMarkers=[];
+    snapped.forEach(s=>{ if(s.moved){
+      const m=L.marker(s.snapped,{icon:SNAP_ICON,title:`snapped ${s.moved_m} m to nearest runnable point`}).addTo(map);
+      state.snapMarkers.push(m);
+    }});
+  }
+  function addWaypoint(lat, lon, label){
+    state.waypoints.push(Object.assign([lat,lon],{label}));
+    renderWaypoints(); drawWpMarkers();
+  }
+  function removeWaypoint(i){ state.waypoints.splice(i,1); renderWaypoints(); drawWpMarkers(); }
+  async function addWaypointByAddr(){
+    const q=document.getElementById('msAddr').value.trim(); if(!q) return;
+    setStatus('Looking up address…');
+    try{
+      const res=await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+      if(!res.ok){ setStatus('Address not found: '+(await res.text()), true); return; }
+      const g=await res.json(); addWaypoint(g.lat,g.lon,g.display_name.split(',')[0]);
+      document.getElementById('msAddr').value=''; setStatus(`Added waypoint "${g.display_name.split(',')[0]}".`);
+    }catch(e){ setStatus('Geocoding error: '+e.message, true); }
+  }
+
+  // ---- saved milestones (server-side milestones.json) ----
+  function renderMilestones(){
+    const wrap=document.getElementById('msSaved'); wrap.innerHTML='';
+    if(!state.milestones.length){ wrap.innerHTML='<span class="empty">None saved yet.</span>'; return; }
+    state.milestones.forEach(m=>{
+      const chip=document.createElement('span'); chip.className='chip';
+      chip.innerHTML=`<span class="nm">${m.name}</span><span class="x" title="Delete">✕</span>`;
+      chip.querySelector('.nm').onclick=()=>applyMilestone(m);
+      chip.querySelector('.x').onclick=(e)=>{ e.stopPropagation(); deleteMilestone(m.name); };
+      wrap.appendChild(chip);
+    });
+  }
+  function applyMilestone(m){
+    state.waypoints = m.waypoints.map((w,i)=>Object.assign([w.lat,w.lon],{label:`${m.name} ${i+1}`}));
+    if(m.miles){ document.getElementById('miles').value=m.miles; state.miles=m.miles; }
+    renderWaypoints(); drawWpMarkers(); generate();
+  }
+  async function loadMilestones(){
+    try{ const r=await fetch('/api/milestones'); if(r.ok){ state.milestones=await r.json(); renderMilestones(); } }
+    catch(e){}
+  }
+  async function saveMilestone(){
+    if(!state.waypoints.length){ setStatus('Add waypoints before saving.', true); return; }
+    const name=document.getElementById('msNameInput').value.trim();
+    if(!name){ setStatus('Name this milestone first.', true); return; }
+    try{
+      const r=await fetch('/api/milestones',{ method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name, waypoints: state.waypoints.map(w=>({lat:w[0],lon:w[1]})),
+          miles: parseFloat(document.getElementById('miles').value) }) });
+      if(!r.ok){ setStatus('Could not save: '+(await r.text()), true); return; }
+      state.milestones=await r.json(); document.getElementById('msNameInput').value='';
+      renderMilestones(); setStatus(`Saved milestone "${name}".`);
+    }catch(e){ setStatus('Save error: '+e.message, true); }
+  }
+  async function deleteMilestone(name){
+    try{ const r=await fetch('/api/milestones/'+encodeURIComponent(name),{method:'DELETE'});
+      if(r.ok){ state.milestones=await r.json(); renderMilestones(); } }catch(e){}
+  }
+
+  // ---- mode switching ----
+  function setMode(mode){
+    state.mode = mode;
+    const ms = mode==='milestone';
+    document.getElementById('msBlock').style.display = ms ? '' : 'none';
+    document.getElementById('msSavedBlock').style.display = ms ? '' : 'none';
+    document.getElementById('go').textContent = ms ? 'Build milestone loops' : 'Generate loops';
+    document.getElementById('savedLabel').textContent = ms ? 'Saved starts (start point)' : 'Saved starts';
+    document.querySelectorAll('#mode button').forEach(b=>b.classList.toggle('active', b.dataset.mode===mode));
+    // clear snap markers when leaving milestone mode
+    if(!ms){ state.snapMarkers.forEach(m=>map.removeLayer(m)); state.snapMarkers=[];
+             state.wpMarkers.forEach(m=>map.removeLayer(m)); state.wpMarkers=[]; }
+    else { drawWpMarkers(); renderWaypoints(); }
+  }
+
+  // Map click drops a waypoint in milestone mode.
+  map.on('click', e=>{ if(state.mode==='milestone') addWaypoint(e.latlng.lat, e.latlng.lng); });
+
   // GPX download button injected into header
   const dl = document.createElement('a');
   dl.id='dlbtn'; dl.className='dl'; dl.href='#';
@@ -251,16 +499,35 @@
   document.getElementById('go').onclick = generate;
   document.getElementById('setStart').onclick = setStart;
   document.getElementById('useHome').onclick = useHome;
+  document.getElementById('saveStart').onclick = saveStart;
   document.getElementById('addr').addEventListener('keydown', e=>{ if(e.key==='Enter') setStart(); });
   document.getElementById('miles').addEventListener('keydown', e=>{ if(e.key==='Enter') generate(); });
+  document.getElementById('startNameInput').addEventListener('keydown', e=>{ if(e.key==='Enter') saveStart(); });
   document.querySelectorAll('#presets button').forEach(b=>{
     b.onclick = ()=>{ document.querySelectorAll('#presets button').forEach(x=>x.classList.remove('active'));
       b.classList.add('active'); document.getElementById('miles').value=b.dataset.mi; generate(); };
   });
+  document.querySelectorAll('#surface button').forEach(b=>{
+    b.onclick = ()=>{ document.querySelectorAll('#surface button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active'); state.surface=b.dataset.surf; generate(); };
+  });
+
+  // milestone wiring
+  document.querySelectorAll('#mode button').forEach(b=>{ b.onclick = ()=>setMode(b.dataset.mode); });
+  document.querySelectorAll('#msPad button').forEach(b=>{
+    b.onclick = ()=>{ document.querySelectorAll('#msPad button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active'); state.pad = b.dataset.pad==='1'; generate(); };
+  });
+  document.getElementById('msAddAddr').onclick = addWaypointByAddr;
+  document.getElementById('msAddr').addEventListener('keydown', e=>{ if(e.key==='Enter') addWaypointByAddr(); });
+  document.getElementById('msSave').onclick = saveMilestone;
+  document.getElementById('msNameInput').addEventListener('keydown', e=>{ if(e.key==='Enter') saveMilestone(); });
 
   // boot
   document.getElementById('startName').textContent='📍 Home (Carlisle, PA)';
-  generate();
+  loadStarts();
+  loadMilestones();
+  generateLoops();
   </script>
 </body>
 </html>

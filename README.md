@@ -4,22 +4,44 @@ A free, self-hostable tool that generates runnable **loop routes** from a start 
 target distance, avoiding highways and roads over 25 mph. See [`PLAN.md`](./PLAN.md) for the
 full design.
 
-> **Status: Phase 3 complete** — the first real UI. Open **http://localhost:8000**: enter
-> a start address (or use home), pick a distance (presets 3/5/8/11 mi or custom), and get
-> ranked in-band candidate loops as selectable cards (distance, elevation gain, road-mix);
-> selecting one updates the map, the elevation profile chart, and the GPX download. Phases
-> 0–2 (rules, reachability, generator) are below. Phase 4 (surface preference, saved start
-> points, caching) is not built yet.
+> **Status: Phase 5 complete** — Milestone Mode added. Open **http://localhost:8000**: enter
+> a start address (or use home / a saved start), pick a distance (presets 3/5/8/11 mi or
+> custom) and a **surface preference** (any / paved / unpaved), and get ranked in-band
+> candidate loops as selectable cards (distance, elevation gain, road-mix); selecting one
+> updates the map, the elevation profile chart, and the GPX download. Start points can be
+> **saved** (named, server-side) and re-selected; generation results are **cached**.
+>
+> **Milestone Mode** (toggle at top of the sidebar): drop pins on the map (or type
+> addresses) for points the loop MUST pass through, then pad out to a target distance —
+> "anchor what I know, generate what I don't." Every leg still runs the `run` profile, so
+> the no-highway / ≤25 mph guarantee carries over; a pin on an excluded road snaps to the
+> nearest runnable edge. `Pad to target` pads up to the chosen distance; `Exact (derived)`
+> just routes through the points. Milestones can be saved. Phases 0–4 are below.
 
 ## API
-- `GET /api/routes?miles=5&lat=&lon=&n=25&tolerance=0.08&k=5` → ranked, **in-band**,
-  de-duplicated candidates (each with geometry, `elevations`, actual distance, gain,
-  road-mix %, score breakdown). Returns fewer than `k` rather than padding with
-  out-of-band loops; `shortfall: true` + `message` when nothing hits tolerance.
+- `GET /api/routes?miles=5&lat=&lon=&n=25&tolerance=0.08&k=5&surface=any&fresh=false` →
+  ranked, **in-band**, de-duplicated candidates (each with geometry, `elevations`, actual
+  distance, gain, road-mix %, score breakdown). Returns fewer than `k` rather than padding
+  with out-of-band loops; `shortfall: true` + `message` when nothing hits tolerance.
   Display band: **±12%** of target (slightly wider than the ±8% tolerance).
-- `GET /api/route?distance_m=8047&lat=&lon=` → the single best candidate.
-- `GET /api/gpx?distance_m=<gen_distance_m>&seed=<seed>&lat=&lon=` → GPX for a chosen loop.
+  `surface` ∈ {`any`,`paved`,`unpaved`} is a **soft** preference (never relaxes the
+  no-highway / ≤25 mph hard rules). Results are cached ~15 min; `fresh=true` bypasses the
+  cache and the response carries `cached: true|false`.
+- `GET /api/route?distance_m=8047&lat=&lon=&surface=any` → the single best candidate.
+- `GET /api/gpx?distance_m=<gen_distance_m>&seed=<seed>&lat=&lon=&surface=any` → GPX for a
+  chosen loop. Pass the candidate's `surface` so the reproduced geometry matches the card.
 - `GET /api/geocode?q=<address>` → `{lat, lon, display_name}` via Nominatim (disk-cached).
+- `GET /api/starts` · `POST /api/starts {name,lat,lon}` (upsert by name) ·
+  `DELETE /api/starts/{name}` → saved start points, persisted to `starts.json`.
+- `POST /api/milestone {waypoints:[{lat,lon}], lat, lon, miles, surface, pad}` → loops
+  through **every** waypoint, padded to `miles` (or derived distance when `pad=false`).
+  Returns the core candidate shape plus `method` (filter/decompose/derived/over_spine),
+  snapped waypoints (with a `moved` flag), `d_spine_mi`, and the honest `over_spine` flag
+  when the points are already farther apart than the target.
+- `GET /api/milestones` · `POST /api/milestones {name,waypoints,miles?}` (upsert) ·
+  `DELETE /api/milestones/{name}` → saved milestones, persisted to `milestones.json`.
+- `POST /api/gpx_track {latlngs, elevations, name}` → GPX built directly from geometry
+  (used for milestone candidates, incl. decomposed composites a round_trip can't reproduce).
 
 ## Stack (Phase 0)
 - **GraphHopper 10.2** as a plain Java JAR (no Docker) — routing + `round_trip` loops.
@@ -68,6 +90,8 @@ scripts/run_backend.sh                # http://localhost:8000
 | `scripts/fetch_data.sh` | Download JAR + PA extract, clip to Carlisle bbox |
 | `scripts/run_graphhopper.sh` | Launch GraphHopper JAR |
 | `scripts/trail_audit.py` | LeTort/borough trail OSM coverage audit → `TRAIL_AUDIT.md` |
-| `backend/main.py` | FastAPI: `/api/route`, `/api/gpx` |
-| `frontend/index.html` | Leaflet map + GPX download |
+| `backend/generator.py` | Loop generator + surface custom-model builder (`surface_custom_model`) |
+| `backend/milestone.py` | Phase 5 milestone mode (filter + decomposition + over-spine) on top of the generator |
+| `backend/main.py` | FastAPI: routes/route/gpx/geocode + saved starts + result cache + milestone + saved milestones |
+| `frontend/index.html` | Leaflet map, candidate cards, elevation chart, surface + saved-starts UI, GPX download |
 | `tests/route_rules/` | Composition probe + rule tests |

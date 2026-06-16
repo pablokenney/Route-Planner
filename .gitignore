@@ -18,10 +18,12 @@ graphhopper/graph-cache/
 graphhopper/srtmprovider/
 *.osm.pbf
 
-# Caches
+# Caches & local user data
 .cache/
 cache/
 geocode_cache.json
+starts.json
+milestones.json
 
 # OS / editor
 .DS_Store
