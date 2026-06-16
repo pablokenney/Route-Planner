@@ -136,10 +136,10 @@ def score_candidate(c: Candidate, target_m: float, target_mi: float) -> None:
 
 
 # --------------------------------------------------------------------------- GH calls
-async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int):
+async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int, start):
     try:
         r = await client.get(f"{GH}/route", params={
-            "point": f"{HOME[0]},{HOME[1]}", "profile": "run", "algorithm": "round_trip",
+            "point": f"{start[0]},{start[1]}", "profile": "run", "algorithm": "round_trip",
             "round_trip.distance": gen_distance_m, "round_trip.seed": seed,
             "ch.disable": "true", "elevation": "true", "points_encoded": "false",
             "instructions": "false", "details": "road_class",
@@ -152,24 +152,31 @@ async def _round_trip(client: httpx.AsyncClient, seed: int, gen_distance_m: int)
     return _make_candidate(seed, gen_distance_m, paths[0]) if paths else None
 
 
-async def _fire(client, jobs: list[tuple[int, int]]) -> list[Candidate]:
-    """jobs = [(seed, gen_distance_m), ...] fired concurrently."""
-    results = await asyncio.gather(*[_round_trip(client, s, d) for s, d in jobs])
+async def _fire(client, jobs: list[tuple[int, int]], start) -> list[Candidate]:
+    """jobs = [(seed, gen_distance_m), ...] fired concurrently from `start`."""
+    results = await asyncio.gather(*[_round_trip(client, s, d, start) for s, d in jobs])
     return [c for c in results if c is not None]
 
 
 # --------------------------------------------------------------------------- generate
 async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
                    k: int = 5, refine_rounds: int = 3,
-                   overlap_threshold: float = 0.6, rng_seed: int | None = None) -> dict:
-    """Return ranked, de-duplicated top-k candidate loops for target_m meters."""
+                   overlap_threshold: float = 0.6, rng_seed: int | None = None,
+                   start: tuple = HOME, display_band: float = 0.12) -> dict:
+    """Return ranked, de-duplicated top-k candidate loops for target_m meters from `start`.
+
+    display_band (presentation only — NOT scoring): only loops whose distance is within
+    this fraction of target are surfaced, so the UI never shows gross padding (e.g. a
+    7-mi loop for a 5-mi request). If NOTHING is in-band, fall back to the closest
+    achievable so the response is never empty, and the honest shortfall flag still fires.
+    """
     target_mi = target_m / MI
     rng = random.Random(rng_seed)
     seeds = rng.sample(range(1, 10_000_000), n)
 
     async with httpx.AsyncClient(timeout=60.0,
                                  limits=httpx.Limits(max_connections=max(n, 32))) as client:
-        pool = await _fire(client, [(s, int(target_m)) for s in seeds])
+        pool = await _fire(client, [(s, int(target_m)) for s in seeds], start)
 
         # Bounded refine: for the best-by-distance seeds not yet in tolerance, re-fire with
         # round_trip.distance nudged by target/actual. Stop early once within tolerance.
@@ -189,19 +196,24 @@ async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
                 jobs.append((c.seed, nudged))
             if not jobs:
                 break
-            pool.extend(await _fire(client, jobs))
+            pool.extend(await _fire(client, jobs, start))
 
     for c in pool:
         score_candidate(c, target_m, target_mi)
     pool.sort(key=lambda c: c.score)
 
-    # De-dup: greedily keep best-scoring loops that aren't near-overlapping with a kept one.
-    kept: list[Candidate] = []
-    for c in pool:
-        if all(_jaccard(c.cells, o.cells) <= overlap_threshold for o in kept):
-            kept.append(c)
-        if len(kept) >= k:
-            break
+    def _dedup(cands: list[Candidate]) -> list[Candidate]:
+        out: list[Candidate] = []
+        for c in cands:
+            if all(_jaccard(c.cells, o.cells) <= overlap_threshold for o in out):
+                out.append(c)
+            if len(out) >= k:
+                break
+        return out
+
+    # Surface only in-band loops (presentation filter); fall back to closest if none.
+    in_band = [c for c in pool if abs(c.distance_m - target_m) / target_m <= display_band]
+    kept = _dedup(in_band) if in_band else _dedup(pool)
 
     best_err = min((c.breakdown["distance_err"] for c in pool), default=1.0)
     shortfall = best_err > tolerance
@@ -209,6 +221,7 @@ async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
         "target_mi": round(target_mi, 2),
         "target_m": round(target_m, 1),
         "tolerance": tolerance,
+        "display_band": display_band,
         "n": n,
         "pool_size": len(pool),
         "shortfall": shortfall,
@@ -231,4 +244,5 @@ def _serialize(c: Candidate, rank: int) -> dict:
         "score_breakdown": c.breakdown,
         "road_mix_pct": c.road_mix(),
         "latlngs": [[pt[1], pt[0]] for pt in c.coords],
+        "elevations": [round(pt[2], 1) if len(pt) > 2 else None for pt in c.coords],
     }

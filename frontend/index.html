@@ -3,65 +3,264 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Route Planner — Phase 0</title>
+  <title>Route Planner</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
-    body { font-family: system-ui, sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; }
-    header { padding: 10px 14px; background: #1f2937; color: #fff; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    header h1 { font-size: 16px; margin: 0 12px 0 0; font-weight: 600; }
-    label { font-size: 13px; }
-    input { width: 80px; padding: 4px 6px; }
-    button { padding: 5px 12px; cursor: pointer; }
-    #stats { font-size: 13px; margin-left: auto; opacity: .9; }
-    #map { flex: 1; }
-    a.gpx { color: #93c5fd; font-size: 13px; }
+    :root { --bg:#0f172a; --panel:#1e293b; --panel2:#273449; --line:#334155;
+            --text:#e2e8f0; --muted:#94a3b8; --accent:#3b82f6; --accent2:#60a5fa; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, sans-serif; color:var(--text);
+           height:100vh; display:flex; flex-direction:column; background:var(--bg); }
+    header { background:var(--panel); padding:10px 16px; display:flex; gap:14px; align-items:center;
+             border-bottom:1px solid var(--line); flex-wrap:wrap; }
+    header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.2px; }
+    header .spacer { flex:1; }
+    .addr { display:flex; gap:6px; align-items:center; }
+    input[type=text], input[type=number] { background:var(--panel2); border:1px solid var(--line);
+            color:var(--text); border-radius:6px; padding:6px 9px; font-size:13px; }
+    input[type=text] { width:260px; }
+    input[type=number] { width:72px; }
+    button { background:var(--accent); color:#fff; border:none; border-radius:6px;
+             padding:6px 12px; font-size:13px; cursor:pointer; font-weight:500; }
+    button.ghost { background:var(--panel2); border:1px solid var(--line); color:var(--text); }
+    button:hover { filter:brightness(1.08); }
+    .main { flex:1; display:flex; min-height:0; }
+    .sidebar { width:340px; background:var(--panel); border-right:1px solid var(--line);
+               display:flex; flex-direction:column; min-height:0; }
+    .controls { padding:14px 16px; border-bottom:1px solid var(--line); }
+    .presets { display:flex; gap:6px; margin:8px 0; }
+    .presets button { flex:1; background:var(--panel2); border:1px solid var(--line); color:var(--text); }
+    .presets button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    .row { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    .label { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    #status { padding:8px 16px; font-size:12px; color:var(--muted); min-height:32px; }
+    #status.warn { color:#fbbf24; }
+    .cards { flex:1; overflow-y:auto; padding:6px 12px 14px; }
+    .card { background:var(--panel2); border:1px solid var(--line); border-radius:9px;
+            padding:10px 12px; margin:8px 0; cursor:pointer; transition:border-color .12s, background .12s; }
+    .card:hover { border-color:var(--accent2); }
+    .card.sel { border-color:var(--accent); background:#1d3a6b; box-shadow:0 0 0 1px var(--accent); }
+    .card .top { display:flex; align-items:baseline; gap:8px; }
+    .card .rank { font-size:11px; color:var(--muted); background:var(--bg); border-radius:10px;
+                  padding:1px 7px; }
+    .card .dist { font-size:20px; font-weight:700; }
+    .card .gain { font-size:12px; color:var(--muted); margin-left:auto; }
+    .mixbar { display:flex; height:7px; border-radius:4px; overflow:hidden; margin:8px 0 5px; }
+    .mixbar span { height:100%; }
+    .mixtext { font-size:11px; color:var(--muted); line-height:1.4; }
+    .stage { flex:1; display:flex; flex-direction:column; min-width:0; }
+    #map { flex:1; }
+    .chartwrap { height:170px; background:var(--panel); border-top:1px solid var(--line);
+                 padding:8px 12px 10px; }
+    .chartwrap .chdr { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+    canvas#elev { width:100%; height:128px; }
+    a.dl { text-decoration:none; }
   </style>
 </head>
 <body>
   <header>
-    <h1>🏃 Route Planner <small style="opacity:.6">Phase 0</small></h1>
-    <label>Distance (mi) <input id="miles" type="number" value="3.1" step="0.1" min="0.6" max="15"></label>
-    <button id="go">Generate loop</button>
-    <a id="gpx" class="gpx" href="#" style="display:none">⬇ Download GPX</a>
-    <span id="stats"></span>
+    <h1>🏃 Route Planner</h1>
+    <div class="addr">
+      <input id="addr" type="text" placeholder="Start address (defaults to home)" />
+      <button id="setStart" class="ghost">Set start</button>
+      <button id="useHome" class="ghost">Home</button>
+    </div>
+    <div class="spacer"></div>
+    <span id="startName" style="font-size:12px;color:var(--muted)"></span>
   </header>
-  <div id="map"></div>
+
+  <div class="main">
+    <aside class="sidebar">
+      <div class="controls">
+        <div class="label">Distance</div>
+        <div class="presets" id="presets">
+          <button data-mi="3">3 mi</button>
+          <button data-mi="5">5 mi</button>
+          <button data-mi="8">8 mi</button>
+          <button data-mi="11">11 mi</button>
+        </div>
+        <div class="row">
+          <input id="miles" type="number" value="5" step="0.1" min="0.6" max="15" />
+          <span class="label">miles</span>
+          <button id="go" style="margin-left:auto">Generate loops</button>
+        </div>
+      </div>
+      <div id="status">Pick a distance and generate.</div>
+      <div class="cards" id="cards"></div>
+    </aside>
+
+    <div class="stage">
+      <div id="map"></div>
+      <div class="chartwrap">
+        <div class="chdr"><span id="chartTitle">Elevation profile</span><span id="chartGain"></span></div>
+        <canvas id="elev"></canvas>
+      </div>
+    </div>
+  </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script>
-    const HOME = [40.195016, -77.199929];
-    const map = L.map('map').setView(HOME, 14);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '© OpenStreetMap'
-    }).addTo(map);
-    L.marker(HOME).addTo(map).bindPopup('Start (home)');
-    let line = null;
+  const HOME = [40.195016, -77.199929];
+  const M2FT = 3.28084, M2MI = 1/1609.344;
+  const CLASS_COLOR = { residential:'#60a5fa', footway:'#34d399', path:'#34d399',
+    cycleway:'#22d3ee', pedestrian:'#34d399', living_street:'#a78bfa', service:'#fbbf24',
+    tertiary:'#f87171', unclassified:'#fb923c', road:'#fb923c', track:'#a3a3a3',
+    steps:'#9ca3af', other:'#cbd5e1' };
 
-    async function generate() {
-      const miles = parseFloat(document.getElementById('miles').value);
-      const distance_m = Math.round(miles * 1609.344);
-      const stats = document.getElementById('stats');
-      stats.textContent = 'Generating…';
-      try {
-        const res = await fetch(`/api/route?distance_m=${distance_m}`);
-        if (!res.ok) { stats.textContent = 'Error: ' + (await res.text()); return; }
-        const d = await res.json();
-        if (line) map.removeLayer(line);
-        line = L.polyline(d.latlngs, { color: '#2563eb', weight: 4 }).addTo(map);
-        map.fitBounds(line.getBounds(), { padding: [30, 30] });
-        const top = Object.entries(d.road_mix_pct || {}).slice(0, 3)
-          .map(([k, v]) => `${k} ${v}%`).join(', ');
-        const flag = d.shortfall ? ` ⚠ ${d.message}` : '';
-        stats.textContent = `${d.distance_mi} mi · +${Math.round(d.ascend_m)} m climb · ${top}${flag}`;
-        const gpx = document.getElementById('gpx');
-        gpx.href = `/api/gpx?distance_m=${d.gen_distance_m}&seed=${d.seed}`;
-        gpx.style.display = 'inline';
-      } catch (e) {
-        stats.textContent = 'Error: ' + e.message;
-      }
+  let state = { start: HOME.slice(), startName: 'Home', miles: 5,
+                data: null, sel: -1, layers: [], chart: null };
+
+  const map = L.map('map', { zoomControl: true }).setView(HOME, 14);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
+  let startMarker = L.marker(HOME, { title: 'Start' }).addTo(map);
+
+  function setStatus(msg, warn=false){ const s=document.getElementById('status');
+    s.textContent=msg; s.className = warn ? 'warn' : ''; }
+
+  function haversine(a,b){ const R=6371000, t=Math.PI/180;
+    const dla=(b[0]-a[0])*t, dlo=(b[1]-a[1])*t;
+    const h=Math.sin(dla/2)**2+Math.cos(a[0]*t)*Math.cos(b[0]*t)*Math.sin(dlo/2)**2;
+    return 2*R*Math.asin(Math.sqrt(h)); }
+
+  function mixBar(mix){
+    const entries = Object.entries(mix);
+    const bar = entries.map(([k,v])=>`<span style="width:${v}%;background:${CLASS_COLOR[k]||CLASS_COLOR.other}"></span>`).join('');
+    const txt = entries.slice(0,3).map(([k,v])=>`${v}% ${k}`).join(' · ');
+    return { bar, txt };
+  }
+
+  function renderCards(){
+    const wrap = document.getElementById('cards'); wrap.innerHTML='';
+    state.data.candidates.forEach((c,i)=>{
+      const {bar,txt} = mixBar(c.road_mix_pct);
+      const div = document.createElement('div');
+      div.className = 'card' + (i===state.sel ? ' sel':'');
+      div.innerHTML = `
+        <div class="top">
+          <span class="rank">#${c.rank}</span>
+          <span class="dist">${c.distance_mi.toFixed(2)} mi</span>
+          <span class="gain">+${Math.round(c.ascend_m*M2FT)} ft</span>
+        </div>
+        <div class="mixbar">${bar}</div>
+        <div class="mixtext">${txt}</div>`;
+      div.onclick = ()=>select(i);
+      div.onmouseenter = ()=>highlight(i,true);
+      div.onmouseleave = ()=>highlight(i,false);
+      wrap.appendChild(div);
+    });
+  }
+
+  function drawAll(){
+    state.layers.forEach(l=>map.removeLayer(l)); state.layers=[];
+    state.data.candidates.forEach((c,i)=>{
+      const ll = c.latlngs.map(p=>[p[0],p[1]]);
+      const line = L.polyline(ll, { color:'#64748b', weight:3, opacity:.55 });
+      line.on('click', ()=>select(i));
+      line.addTo(map); state.layers.push(line);
+    });
+  }
+  function highlight(i, on){
+    if(state.layers[i] && i!==state.sel)
+      state.layers[i].setStyle({ color: on?'#93c5fd':'#64748b', weight: on?4:3, opacity: on?.9:.55 });
+  }
+  function select(i){
+    state.sel = i;
+    state.layers.forEach((l,j)=>l.setStyle(j===i
+      ? { color:'#2563eb', weight:5, opacity:1 } : { color:'#64748b', weight:3, opacity:.45 }));
+    state.layers[i].bringToFront();
+    map.fitBounds(state.layers[i].getBounds(), { padding:[40,40] });
+    renderCards();
+    renderChart(state.data.candidates[i]);
+    const c = state.data.candidates[i];
+    const dl = document.getElementById('dlbtn');
+    dl.href = `/api/gpx?distance_m=${c.gen_distance_m}&seed=${c.seed}&lat=${state.start[0]}&lon=${state.start[1]}`;
+  }
+
+  function renderChart(c){
+    // cumulative distance (mi) vs elevation (ft)
+    const xs=[], ys=[]; let cum=0;
+    for(let i=0;i<c.latlngs.length;i++){
+      if(i>0) cum += haversine(c.latlngs[i-1], c.latlngs[i]);
+      xs.push(+(cum*M2MI).toFixed(3));
+      ys.push(c.elevations[i]!=null ? +(c.elevations[i]*M2FT).toFixed(0) : null);
     }
-    document.getElementById('go').addEventListener('click', generate);
-    generate();
+    document.getElementById('chartGain').textContent =
+      `${c.distance_mi.toFixed(2)} mi · +${Math.round(c.ascend_m*M2FT)} ft gain / −${Math.round(c.descend_m*M2FT)} ft`;
+    const cfg = {
+      type:'line',
+      data:{ labels:xs, datasets:[{ data:ys, borderColor:'#3b82f6',
+        backgroundColor:'rgba(59,130,246,.18)', fill:true, pointRadius:0, borderWidth:2, tension:.3 }]},
+      options:{ responsive:true, maintainAspectRatio:false, animation:false,
+        scales:{ x:{ type:'linear', title:{display:true,text:'miles',color:'#94a3b8'},
+                     ticks:{color:'#94a3b8',maxTicksLimit:8}, grid:{color:'#1e293b'} },
+                 y:{ title:{display:true,text:'ft',color:'#94a3b8'},
+                     ticks:{color:'#94a3b8'}, grid:{color:'#1e293b'} } },
+        plugins:{ legend:{display:false},
+          tooltip:{ callbacks:{ title:i=>`${i[0].label} mi`, label:i=>`${i.raw} ft` } } } }
+    };
+    if(state.chart){ state.chart.data=cfg.data; state.chart.options=cfg.options; state.chart.update(); }
+    else state.chart = new Chart(document.getElementById('elev'), cfg);
+  }
+
+  async function generate(){
+    setStatus('Generating loops…');
+    document.getElementById('cards').innerHTML='';
+    const mi = parseFloat(document.getElementById('miles').value);
+    state.miles = mi;
+    try{
+      const u = `/api/routes?miles=${mi}&lat=${state.start[0]}&lon=${state.start[1]}`;
+      const res = await fetch(u);
+      if(!res.ok){ setStatus('Error: '+(await res.text()), true); return; }
+      const d = await res.json(); state.data = d; state.sel=-1;
+      if(d.shortfall) setStatus(`⚠ ${d.message} — showing closest available.`, true);
+      else setStatus(`${d.candidates.length} loop${d.candidates.length>1?'s':''} near ${mi} mi (within ±${Math.round(d.display_band*100)}%).`);
+      drawAll(); renderCards();
+      if(d.candidates.length) select(0);
+    }catch(e){ setStatus('Error: '+e.message, true); }
+  }
+
+  async function setStart(){
+    const q = document.getElementById('addr').value.trim();
+    if(!q){ return; }
+    setStatus('Looking up address…');
+    try{
+      const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+      if(!res.ok){ setStatus('Address not found: '+(await res.text()), true); return; }
+      const g = await res.json();
+      state.start=[g.lat,g.lon]; state.startName=g.display_name;
+      document.getElementById('startName').textContent = '📍 '+g.display_name.split(',').slice(0,2).join(',');
+      startMarker.setLatLng(state.start); map.setView(state.start, 14);
+      generate();
+    }catch(e){ setStatus('Geocoding error: '+e.message, true); }
+  }
+  function useHome(){
+    state.start=HOME.slice(); state.startName='Home';
+    document.getElementById('addr').value='';
+    document.getElementById('startName').textContent='📍 Home (Carlisle, PA)';
+    startMarker.setLatLng(HOME); map.setView(HOME,14); generate();
+  }
+
+  // GPX download button injected into header
+  const dl = document.createElement('a');
+  dl.id='dlbtn'; dl.className='dl'; dl.href='#';
+  dl.innerHTML='<button class="ghost">⬇ GPX</button>';
+  document.querySelector('header .spacer').after(dl);
+
+  document.getElementById('go').onclick = generate;
+  document.getElementById('setStart').onclick = setStart;
+  document.getElementById('useHome').onclick = useHome;
+  document.getElementById('addr').addEventListener('keydown', e=>{ if(e.key==='Enter') setStart(); });
+  document.getElementById('miles').addEventListener('keydown', e=>{ if(e.key==='Enter') generate(); });
+  document.querySelectorAll('#presets button').forEach(b=>{
+    b.onclick = ()=>{ document.querySelectorAll('#presets button').forEach(x=>x.classList.remove('active'));
+      b.classList.add('active'); document.getElementById('miles').value=b.dataset.mi; generate(); };
+  });
+
+  // boot
+  document.getElementById('startName').textContent='📍 Home (Carlisle, PA)';
+  generate();
   </script>
 </body>
 </html>

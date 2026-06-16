@@ -4,18 +4,22 @@ A free, self-hostable tool that generates runnable **loop routes** from a start 
 target distance, avoiding highways and roads over 25 mph. See [`PLAN.md`](./PLAN.md) for the
 full design.
 
-> **Status: Phase 2 complete** — the real loop generator: N=25 concurrent `round_trip`
-> seeds, distance-dominant (distance-aware) scoring, overlap de-dup, bounded refine, and
-> ranked top-5 output with an honest shortfall flag (`/api/routes`). Phases 0–1 (rules +
-> reachability) are below. Phases 3–4 (elevation chart, candidate-switcher UI, surface
-> preference, saved starts) are not built yet.
+> **Status: Phase 3 complete** — the first real UI. Open **http://localhost:8000**: enter
+> a start address (or use home), pick a distance (presets 3/5/8/11 mi or custom), and get
+> ranked in-band candidate loops as selectable cards (distance, elevation gain, road-mix);
+> selecting one updates the map, the elevation profile chart, and the GPX download. Phases
+> 0–2 (rules, reachability, generator) are below. Phase 4 (surface preference, saved start
+> points, caching) is not built yet.
 
-## Generator API
-- `GET /api/routes?miles=5&n=25&tolerance=0.08&k=5` → ranked candidates, each with
-  geometry, actual distance, gain, road-mix %, and score breakdown; `shortfall: true` +
-  `message` when no candidate hits tolerance.
-- `GET /api/route?distance_m=8047` → the single best candidate (drives the map UI).
-- `GET /api/gpx?distance_m=<gen_distance_m>&seed=<seed>` → GPX for a chosen candidate.
+## API
+- `GET /api/routes?miles=5&lat=&lon=&n=25&tolerance=0.08&k=5` → ranked, **in-band**,
+  de-duplicated candidates (each with geometry, `elevations`, actual distance, gain,
+  road-mix %, score breakdown). Returns fewer than `k` rather than padding with
+  out-of-band loops; `shortfall: true` + `message` when nothing hits tolerance.
+  Display band: **±12%** of target (slightly wider than the ±8% tolerance).
+- `GET /api/route?distance_m=8047&lat=&lon=` → the single best candidate.
+- `GET /api/gpx?distance_m=<gen_distance_m>&seed=<seed>&lat=&lon=` → GPX for a chosen loop.
+- `GET /api/geocode?q=<address>` → `{lat, lon, display_name}` via Nominatim (disk-cached).
 
 ## Stack (Phase 0)
 - **GraphHopper 10.2** as a plain Java JAR (no Docker) — routing + `round_trip` loops.
