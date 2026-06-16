@@ -1,0 +1,35 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+frontend/dist/
+
+# OSM data & GraphHopper artifacts (large, regenerable)
+data/*.osm.pbf
+data/*.osm
+graphhopper/*.jar
+graphhopper/graph-cache/
+graphhopper/srtmprovider/
+*.osm.pbf
+
+# Caches
+.cache/
+cache/
+geocode_cache.json
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Audit/probe outputs (regenerable artifacts; keep the .md summaries)
+scripts/*.png
+scripts/_trail_audit.json
+tests/route_rules/_probe_output.json

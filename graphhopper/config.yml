@@ -1,0 +1,75 @@
+# GraphHopper config — Phase 0 (composition probe).
+# Run via: scripts/run_graphhopper.sh  (plain Java JAR, no Docker)
+#
+# Phase 0 goal: prove round_trip honors the EXCLUSION-only custom model below.
+# Preference multipliers (>1) are intentionally OMITTED until Phase 1 — under flex they
+# belong in the server-side profile, but Phase 0 only needs the exclusions to probe.
+
+graphhopper:
+  datareader.file: data/carlisle.osm.pbf
+  graph.location: graphhopper/graph-cache
+
+  # Import EVERY highway class (empty = ignore none). Deliberate: keeping motorway/trunk/
+  # primary/secondary edges in the graph makes the composition probe meaningful — it then
+  # proves the custom model EXCLUDES them, rather than them simply being absent.
+  import.osm.ignored_highways: ""
+
+  # Encoded values we key rules on and request via details=... in the probe.
+  # (foot_access / foot_average_speed / foot_priority come from the foot base model.)
+  graph.encoded_values: road_class, max_speed, surface, road_access, foot_access, hike_rating, mtb_rating, foot_priority, foot_average_speed
+
+  # Where custom_model_files (run-profile.json) are resolved from. Relative to the CWD,
+  # which run_graphhopper.sh sets to the repo root. foot.json is still found as a builtin.
+  custom_models.directory: graphhopper
+
+  # run-profile.json exclusion rationale (see PLAN.md §3):
+  #  - road_class==X also covers X_link ramps (link is a separate boolean), so excluding
+  #    MOTORWAY/TRUNK/PRIMARY/SECONDARY covers their ramps automatically.
+  #  - speed rule "max_speed > 45 && max_speed < 200": 45 (not 40) gives margin for
+  #    DecimalEncodedValue rounding of 25 mph=40.23 km/h up to ~45; the <200 upper bound
+  #    keeps untagged roads if untagged max_speed evaluates to Infinity. The probe confirms.
+
+  profiles:
+    - name: run
+      # Base on the JAR-shipped foot.json, then layer our exclusion rules on top.
+      # GraphHopper merges custom_model_files in order.
+      custom_model_files: [foot.json, run-profile.json]
+    # Diagnostic profile: plain foot, NO exclusions. Used by the probe to read back the
+    # RAW stored max_speed of a known 25-mph street (so we see the value even if the
+    # `run` profile would have excluded it). Not used by the app.
+    - name: foot_raw
+      custom_model_files: [foot.json]
+
+  # Flex mode: NO contraction hierarchies (round_trip requires ch.disable=true).
+  # Leaving profiles_ch empty keeps the engine in flexible mode.
+  profiles_ch: []
+
+  # Landmarks speed up flex queries; optional for Phase 0. Kept off to remove a variable
+  # while probing — pure flex (Dijkstra/A*) is fine on a small Carlisle bbox.
+  profiles_lm: []
+
+  # Elevation — SRTM 30m, cached locally (3DEP deferred).
+  graph.elevation.provider: srtm
+  graph.elevation.cache_dir: graphhopper/srtmprovider/
+
+  # Allow round_trip / alternative algorithms in flex mode.
+  routing.non_ch.max_waypoint_distance: 1000000
+
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{HH:mm:ss} %-5p %c{1} - %m%n"
+  level: INFO

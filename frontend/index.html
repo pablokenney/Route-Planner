@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Route Planner — Phase 0</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+    header { padding: 10px 14px; background: #1f2937; color: #fff; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    header h1 { font-size: 16px; margin: 0 12px 0 0; font-weight: 600; }
+    label { font-size: 13px; }
+    input { width: 80px; padding: 4px 6px; }
+    button { padding: 5px 12px; cursor: pointer; }
+    #stats { font-size: 13px; margin-left: auto; opacity: .9; }
+    #map { flex: 1; }
+    a.gpx { color: #93c5fd; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🏃 Route Planner <small style="opacity:.6">Phase 0</small></h1>
+    <label>Distance (mi) <input id="miles" type="number" value="3.1" step="0.1" min="0.6" max="15"></label>
+    <label>Seed <input id="seed" type="number" value="1" step="1"></label>
+    <button id="go">Generate loop</button>
+    <a id="gpx" class="gpx" href="#" style="display:none">⬇ Download GPX</a>
+    <span id="stats"></span>
+  </header>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const HOME = [40.195016, -77.199929];
+    const map = L.map('map').setView(HOME, 14);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '© OpenStreetMap'
+    }).addTo(map);
+    L.marker(HOME).addTo(map).bindPopup('Start (home)');
+    let line = null;
+
+    async function generate() {
+      const miles = parseFloat(document.getElementById('miles').value);
+      const seed = parseInt(document.getElementById('seed').value, 10);
+      const distance_m = Math.round(miles * 1609.344);
+      const stats = document.getElementById('stats');
+      stats.textContent = 'Generating…';
+      try {
+        const res = await fetch(`/api/route?distance_m=${distance_m}&seed=${seed}`);
+        if (!res.ok) { stats.textContent = 'Error: ' + (await res.text()); return; }
+        const d = await res.json();
+        if (line) map.removeLayer(line);
+        line = L.polyline(d.latlngs, { color: '#2563eb', weight: 4 }).addTo(map);
+        map.fitBounds(line.getBounds(), { padding: [30, 30] });
+        stats.textContent = `${d.distance_mi} mi · +${Math.round(d.ascend_m)} m climb`;
+        const gpx = document.getElementById('gpx');
+        gpx.href = `/api/gpx?distance_m=${distance_m}&seed=${seed}`;
+        gpx.style.display = 'inline';
+      } catch (e) {
+        stats.textContent = 'Error: ' + e.message;
+      }
+    }
+    document.getElementById('go').addEventListener('click', generate);
+    generate();
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Phase 0 backend + tooling deps. Install into .venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r backend/requirements.txt
+fastapi
+uvicorn[standard]
+gpxpy
+requests
+pytest
+# Trail audit (Step 1) — heavy geo stack
+osmnx
