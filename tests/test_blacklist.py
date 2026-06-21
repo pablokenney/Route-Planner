@@ -79,3 +79,13 @@ def test_generated_loops_avoid_blacklisted_roads():
         for c in r["candidates"]:
             assert _points_inside(c["latlngs"], polys) == 0, (
                 f"loop #{c['rank']} ({c['distance_mi']} mi) entered a blacklisted road")
+
+
+def test_buffer_does_not_clip_letort_trail_tip():
+    # The avoidance buffer must block the Heisers/Bonnybrook roadway WITHOUT swallowing the
+    # LeTort Nature Trail's south end ~21 m away — clipping it re-severs the trail (the bug that
+    # made loops stop at South Spring St). If a future BUFFER_M bump re-clips it, fail loudly.
+    polys = _polys()
+    tip = (40.16197, -77.17292)  # LeTort trail south end (= SPUR_TIPS[0])
+    assert not any(_point_in_ring((tip[1], tip[0]), ring) for ring in polys), (
+        "the LeTort trail tip is inside an avoidance polygon — buffer too wide, trail re-severed")

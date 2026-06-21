@@ -27,7 +27,11 @@ OUT = os.path.join(ROOT, "data", "blacklist_areas.json")
 # Exact OSM `name` tags to avoid. Add a road here and re-run to block it.
 BLACKLIST_NAMES = {"Heisers Lane", "Bonnybrook Road"}
 
-BUFFER_M = 22.0      # half-width of the avoidance sleeve around each road centerline
+# Half-width of the avoidance sleeve around each road centerline. Kept tight (covers the
+# roadway + shoulder) so it blocks the road itself without clipping nearby trails that run
+# parallel — e.g. the LeTort Nature Trail's south end is ~21 m from Heisers Lane, so a wider
+# buffer would swallow the trail tip and sever it. Keep BUFFER_M comfortably below that.
+BUFFER_M = 14.0
 MAX_PTS = 40         # decimate long roads to keep request payloads small
 
 

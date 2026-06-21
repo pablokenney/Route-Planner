@@ -12,6 +12,7 @@ saved starts, result caching, and milestone mode (exact waypoints, padded distan
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -35,7 +36,7 @@ from .generator import (
 )
 from .milestone import milestone as milestone_generate
 from .outback import out_and_backs
-from .segment_seek import segment_loops
+from .segment_seek import segment_loops, spur_loops
 
 GH = os.environ.get("GH_URL", "http://localhost:8989")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -113,15 +114,23 @@ async def routes(
             return {**cached, "cached": True}
 
     try:
-        # Fold two kinds of constructed routes into the same pool the random loops compete in:
-        # pure out-and-backs, and loops that pass through nearby known segments (the latter so
-        # a loved trail like the LeTort Nature Trail actually shows up — round_trip never seeks
-        # it on its own). Both are scored/de-duped/ranked by generate()'s single objective.
-        extra: list = []
+        # Fold three kinds of constructed routes into the same pool the random loops compete in:
+        # pure out-and-backs; loops through nearby known segments (so a loved trail like the
+        # LeTort Nature Trail shows up — round_trip never seeks it on its own); and down-and-back
+        # spurs to curated dead-end trail tips a loop can't otherwise reach (e.g. the LeTort
+        # south end, which only connects onward via the excluded Heisers Lane). All are
+        # scored/de-duped/ranked by generate()'s single objective.
+        # The three constructors are independent fan-outs — run them concurrently so they add
+        # ~one fan-out of latency, not three in series.
+        builders = [
+            segment_loops(start=(lat, lon), target_m=miles * MI,
+                          surface=surface, tolerance=tolerance, k=k),
+            spur_loops(start=(lat, lon), target_m=miles * MI,
+                       surface=surface, tolerance=tolerance, k=k),
+        ]
         if out_back:
-            extra += await out_and_backs(start=(lat, lon), target_m=miles * MI, surface=surface)
-        extra += await segment_loops(start=(lat, lon), target_m=miles * MI,
-                                     surface=surface, tolerance=tolerance, k=k)
+            builders.append(out_and_backs(start=(lat, lon), target_m=miles * MI, surface=surface))
+        extra: list = [c for group in await asyncio.gather(*builders) for c in group]
         result = await generate(miles * MI, n=n, tolerance=tolerance, k=k,
                                 start=(lat, lon), surface=surface,
                                 extra_candidates=extra or None)

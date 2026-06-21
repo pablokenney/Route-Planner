@@ -89,7 +89,7 @@ async def segment_loops(start: tuple, target_m: float, surface: str = "any",
     async with httpx.AsyncClient(timeout=60.0,
                                  limits=httpx.Limits(max_connections=32)) as client:
         built = await asyncio.gather(
-            *[_loops_through_segment(client, start_ll, near, far, target_m, cmodel, band, k)
+            *[_loops_through_via(client, start_ll, [near, far], target_m, cmodel, band, k)
               for _, near, far in chosen])
 
     out: list[Candidate] = []
@@ -98,27 +98,70 @@ async def segment_loops(start: tuple, target_m: float, surface: str = "any",
     return out
 
 
-async def _loops_through_segment(client: httpx.AsyncClient, start_ll, near, far,
-                                 target_m: float, cmodel: dict | None, band: float,
-                                 k: int) -> list[Candidate]:
-    """[pad loop @ start]→[start→near→[segment]→far]→[retrace] composites. The out-and-back runs
-    the whole segment; the pad round_trip is at the START (reliable) — not the segment's far end —
-    and is REFINED toward the remaining budget so composites land in-band. Returns only in-band
-    Candidates (empty if the segment can't fit a target_m loop)."""
-    out = await _route(client, [start_ll, near, far], cmodel)  # start→near→[segment]→far
+# Curated dead-end trail tips worth running an out-and-back to. A loop never reaches these on
+# its own (they dead-end — e.g. the LeTort Nature Trail's south end only connects onward via
+# Heisers Lane, which the safety block excludes), so we construct a down-and-back spur to each
+# one in range and fold it in. Because the tip is reachable ONLY via the trail, the out leg
+# necessarily runs the trail down and the back leg retraces it. Each entry is {name, lat, lon}.
+SPUR_TIPS = [
+    {"name": "LeTort Nature Trail (south end)", "lat": 40.16197, "lon": -77.17292},
+]
+
+
+async def spur_loops(start: tuple, target_m: float, surface: str = "any",
+                     tolerance: float = 0.08, k: int = 5, band: float = 0.12) -> list[Candidate]:
+    """Loops that include a down-and-back to a curated dead-end trail tip (SPUR_TIPS), folded into
+    the loop pool like segment_loops. Marked as retraces. Empty when no tip is in range."""
+    if not SPUR_TIPS:
+        return []
+    start_ll = [start[1], start[0]]
+    cmodel = route_custom_model(surface)
+    tips = [[t["lon"], t["lat"]] for t in SPUR_TIPS
+            if 2 * _hav(start_ll, [t["lon"], t["lat"]]) <= target_m * (1 + tolerance)]
+    if not tips:
+        return []
+    async with httpx.AsyncClient(timeout=60.0,
+                                 limits=httpx.Limits(max_connections=32)) as client:
+        built = await asyncio.gather(
+            *[_loops_through_via(client, start_ll, [tip], target_m, cmodel, band, k, spur=True)
+              for tip in tips])
+    out: list[Candidate] = []
+    for group in built:
+        out.extend(group)
+    return out
+
+
+async def _loops_through_via(client: httpx.AsyncClient, start_ll, via: list,
+                             target_m: float, cmodel: dict | None, band: float,
+                             k: int, spur: bool = False) -> list[Candidate]:
+    """[pad loop @ start]→[start→via…]→[retrace] composites sized to target_m. The out leg routes
+    through the via points (a segment's two endpoints, or a single dead-end trail tip) and the
+    back leg retraces it, so the out-and-back runs that trail; the pad round_trip is at the START
+    (reliable) and is REFINED toward the remaining budget so composites land in-band.
+
+    spur=True marks results as retraces (route_type='out_and_back' + overlap_pct) — used for
+    dead-end tips, where the out-and-back is most of the route. Returns only in-band Candidates."""
+    out = await _route(client, [start_ll, *via], cmodel)  # start→via… (and retrace home)
     if out is None:
         return []
     back = _reverse_path(out)
-    pad_budget = target_m - 2.0 * float(out.get("distance", 0.0))
+    d_out = float(out.get("distance", 0.0))
+    pad_budget = target_m - 2.0 * d_out
 
     def in_band(c: Candidate) -> bool:
         return abs(c.distance_m - target_m) / target_m <= band
 
-    # Running the segment out-and-back already ≈ target (no room to pad): take it if it fits.
+    def tag(c: Candidate) -> Candidate:
+        if spur:  # the down-and-back trail leg is retraced — label honestly so the UI badges it
+            c.route_type = "out_and_back"
+            c.overlap_pct = round(100.0 * min(1.0, 2.0 * d_out / max(c.distance_m, 1.0)), 1)
+        return c
+
+    # The out-and-back alone already ≈ target (no room to pad): take it if it fits.
     if pad_budget < MIN_PAD_M:
         c = _make_candidate(seed=-1, gen_distance_m=int(round(target_m)),
                             path=_merge_paths([out, back]))
-        return [c] if in_band(c) else []
+        return [tag(c)] if in_band(c) else []
 
     start_pt = (start_ll[1], start_ll[0])  # round_trip_body wants (lat, lon)
 
@@ -142,11 +185,11 @@ async def _loops_through_segment(client: httpx.AsyncClient, start_ll, near, far,
         for (s, g), p in zip(jobs, paths):
             if p is None:
                 continue
-            # pad loop returns to start, then the out-and-back runs the segment and comes home.
+            # pad loop returns to start, then the out-and-back runs the trail and comes home.
             c = _make_candidate(seed=0, gen_distance_m=int(round(target_m)),
                                 path=_merge_paths([p, out, back]))
             if in_band(c):
-                kept.append(c)
+                kept.append(tag(c))
                 continue
             # Nudge this seed's pad target toward the budget the actual loop missed.
             pad_actual = float(p.get("distance", 0.0))
@@ -156,6 +199,6 @@ async def _loops_through_segment(client: httpx.AsyncClient, start_ll, near, far,
         if len(kept) >= k or not retry:
             break
         jobs = retry
-    # Keep only the most distance-accurate few per segment (avoid flooding with near-duplicates).
+    # Keep only the most distance-accurate few (avoid flooding with near-duplicates).
     kept.sort(key=lambda c: abs(c.distance_m - target_m))
     return kept[:PER_SEGMENT]
