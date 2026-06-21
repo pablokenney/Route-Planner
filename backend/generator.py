@@ -13,6 +13,7 @@ expectation — a long loop is not penalized for doing what the network requires
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import random
@@ -97,6 +98,61 @@ def surface_custom_model(surface: str) -> dict | None:
     priority = [{"if": f"surface == {s}", "multiply_by": _SURFACE_PREFER} for s in prefer]
     priority += [{"if": f"surface == {s}", "multiply_by": _SURFACE_DEMOTE} for s in demote]
     return {"priority": priority}
+
+
+# ---------------------------------------------------------- blacklisted roads (safety block)
+# Specific roads the user has run and found unsafe (no sidewalk/shoulder + fast traffic) are
+# avoided at the ROUTING layer, not by post-filtering whole candidates: GraphHopper routes
+# AROUND them (so nearby trails like LeTort / Cress Bed still compose into loops) instead of
+# us deleting any loop that merely clips one. Each road is a buffered polygon (an `area`) whose
+# priority is zeroed, so no edge inside it can be used. The polygons are generated offline by
+# scripts/build_blacklist.py from the OSM extract; edit BLACKLIST_NAMES there and re-run to
+# add a road. Absent/empty file → no block (feature degrades gracefully).
+_BLACKLIST_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "data", "blacklist_areas.json")
+
+
+def _load_blacklist() -> tuple[dict | None, list[str]]:
+    """Return (areas FeatureCollection, [feature_id, ...]) or (None, []) if unavailable."""
+    try:
+        with open(_BLACKLIST_FILE) as f:
+            fc = json.load(f)
+    except (OSError, ValueError):
+        return None, []
+    feats = fc.get("features", []) if isinstance(fc, dict) else []
+    ids = [f["id"] for f in feats if f.get("id")]
+    return (fc, ids) if ids else (None, [])
+
+
+_BLACKLIST_FC, _BLACKLIST_IDS = _load_blacklist()
+
+
+def _blacklist_block() -> dict | None:
+    """Custom-model fragment that zeroes priority inside every blacklisted-road polygon."""
+    if not _BLACKLIST_IDS:
+        return None
+    cond = " || ".join(f"in_{i}" for i in _BLACKLIST_IDS)
+    return {"priority": [{"if": cond, "multiply_by": "0"}], "areas": _BLACKLIST_FC}
+
+
+def route_custom_model(surface: str) -> dict | None:
+    """The per-request custom model actually sent to GraphHopper: the surface preference
+    (if any) MERGED with the blacklisted-road block (if any). Either part may be absent.
+
+    Merge is order-free and safe: priority statements multiply, so the blacklist's
+    `multiply_by 0` zeroes a bad edge regardless of any surface multiplier, and the surface
+    nudges only reshape among the remaining (allowed) edges. Returns None when neither applies.
+    """
+    surface_model = surface_custom_model(surface)
+    block = _blacklist_block()
+    if block is None:
+        return surface_model
+    if surface_model is None:
+        return block
+    return {
+        "priority": surface_model.get("priority", []) + block["priority"],
+        "areas": block["areas"],
+    }
 
 
 # ----------------------------------------------------------------------------- geometry
@@ -284,7 +340,7 @@ async def generate(target_m: float, n: int = 25, tolerance: float = 0.08,
     the safety model already governs them; here they are just scored and ranked alongside.
     """
     target_mi = target_m / MI
-    cmodel = surface_custom_model(surface)
+    cmodel = route_custom_model(surface)
     rng = random.Random(rng_seed)
     seeds = rng.sample(range(1, 10_000_000), n)
 

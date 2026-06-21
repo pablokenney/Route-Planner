@@ -95,9 +95,11 @@ def test_padded_distance_within_tolerance_multiple_runs():
 
 # ----------------------------------------------------------------------- over-spine
 def test_over_spine_is_honest_never_silent_drop():
-    # two far-apart anchors, impossibly small target -> can't pad down
+    # two far-apart anchors, impossibly small target -> can't pad down.
+    # (far_b is kept clear of the blacklisted Heisers/Bonnybrook corridors so the spine
+    # routes; the point of this test is the over-spine flag, not the avoidance block.)
     far_a = (40.2074, -77.2010)
-    far_b = (40.1607, -77.1936)
+    far_b = (40.2150, -77.1850)
     r = _run(milestone(HOME, [far_a, far_b], 2 * MI))
     assert r["over_spine"] is True
     assert r["shortfall"] is True
@@ -196,26 +198,19 @@ def test_derived_distance_mode_routes_through_points():
 
 
 # --------------------------------------------------------------- out-and-back (retrace)
-def test_out_and_back_padded_is_retraced_and_includes_waypoint():
-    r = _run(milestone(HOME, [FIELDS], 6 * MI, out_back=True, k=4))
-    assert r["method"] == "out_and_back"
-    assert r["candidates"], "should build at least one padded out-and-back"
+def test_out_and_backs_are_folded_into_padded_milestone_results():
+    # No shape toggle: padded milestone returns loops AND pure out-and-backs, ranked together
+    # and badged (route_type). At least one retraced out-and-back through the waypoint appears.
+    r = _run(milestone(HOME, [FIELDS], 6 * MI, k=8))
+    assert r["candidates"], "should build padded routes through the waypoint"
+    types = {c["route_type"] for c in r["candidates"]}
+    assert types <= {"loop", "out_and_back"}
+    obs = [c for c in r["candidates"] if c["route_type"] == "out_and_back"]
+    assert obs, "pure out-and-backs should be folded into the padded results"
     swll = _snapped_ll(r)
-    for c in r["candidates"]:
-        assert c["route_type"] == "out_and_back"
+    for c in obs:
         assert c["overlap_pct"] >= 70.0, f"only {c['overlap_pct']:.0f}% retraced — not a real retrace"
         assert min_dist_to_polyline_m(swll[0], _coords_lonlat(c)) <= EPS_M + 1
         assert abs(c["distance_mi"] - 6.0) / 6.0 <= 0.12
         # the carried-over safety model still governs every leg of the retrace
         assert not (set(c["road_mix_pct"].keys()) & EXCLUDED_CLASSES)
-
-
-def test_out_and_back_derived_is_plain_there_and_back():
-    r = _run(milestone(HOME, [FIELDS], None, pad=False, out_back=True))
-    assert r["method"] == "out_and_back"
-    assert len(r["candidates"]) == 1
-    c = r["candidates"][0]
-    assert c["route_type"] == "out_and_back"
-    assert c["overlap_pct"] >= 70.0
-    # a there-and-back is ~twice the one-way spine to the single waypoint
-    assert min_dist_to_polyline_m(_snapped_ll(r)[0], _coords_lonlat(c)) <= EPS_M + 1

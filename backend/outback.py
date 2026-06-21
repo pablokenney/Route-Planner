@@ -32,7 +32,7 @@ from .generator import (
     _jaccard,
     _make_candidate,
     project_point,
-    surface_custom_model,
+    route_custom_model,
 )
 from .milestone import _merge_paths, _reverse_path, _route
 
@@ -118,7 +118,7 @@ async def out_and_backs(start: tuple = HOME, target_m: float = 5 * MI, surface: 
     generator.generate(extra_candidates=...), where they are scored and ranked beside loops.
     """
     start_ll = [start[1], start[0]]
-    cmodel = surface_custom_model(surface)
+    cmodel = route_custom_model(surface)
     bearings = [i * 360.0 / n_bearings for i in range(n_bearings)]
     async with httpx.AsyncClient(timeout=60.0,
                                  limits=httpx.Limits(max_connections=max(n_bearings, 16))) as client:

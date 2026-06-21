@@ -6,7 +6,7 @@ out to the target (±5–8%).
 
 This module sits strictly ON TOP of the locked Phase 0–2 engine. It imports the generator's
 own primitives (`_fire`, `_make_candidate`, `score_candidate`, `_serialize`, `_cells`,
-`_jaccard`, `surface_custom_model`) and never re-implements or relaxes any of them. Every
+`_jaccard`, `route_custom_model`) and never re-implements or relaxes any of them. Every
 GraphHopper call here uses `profile=run`, so the full safety model (no motorway/trunk/
 primary/secondary, no explicit max_speed>45, the tertiary penalties, the footway/path
 preferences) applies to EVERY leg automatically. A waypoint is snapped by GraphHopper to the
@@ -46,8 +46,8 @@ from .generator import (
     _make_candidate,
     _serialize,
     project_point,
+    route_custom_model,
     score_candidate,
-    surface_custom_model,
 )
 
 # --- tunables (PLAN.md §Phase 5: "Choose/document ε" and "Document the threshold") --------
@@ -297,19 +297,18 @@ def _tag_out_and_back(c: Candidate, out_path: dict, back_path: dict) -> None:
 async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None,
                     surface: str = "any", pad: bool = True, eps_m: float = EPS_M,
                     n: int = FILTER_N, tolerance: float = 0.08, k: int = 5,
-                    filter_min: int = FILTER_MIN_CANDIDATES,
-                    out_back: bool = False) -> dict:
+                    filter_min: int = FILTER_MIN_CANDIDATES) -> dict:
     """Generate routes through every waypoint, padded to target_m (or derived if pad=False).
 
     start, waypoints: (lat, lon) tuples (UI/geocoder order). Internally we work in [lon,lat].
     pad=False  → "exact-waypoints, derived-distance": route through the points and report
                  whatever distance results (target_m ignored). Same machinery, no padding.
     pad=True   → pad UP to target_m within tolerance via FILTER, else DECOMPOSE.
-    out_back   → build pure OUT-AND-BACK routes that run out through every waypoint and retrace
-                 the same path home (a true retrace), instead of loops. Honors pad: a derived
-                 out-and-back is the plain there-and-back; a padded one extends past the last
-                 waypoint to hit the target. Falls back to loop generation if no out-and-back
-                 can be built (e.g. the retrace already overshoots the target).
+
+    Pure OUT-AND-BACK routes (run out through every waypoint and retrace the same path home)
+    are ALSO built and folded into the same candidate pool — scored, de-duplicated, and ranked
+    alongside the loops, exactly as the Loops tab folds out-and-backs via `extra_candidates`.
+    Each carries route_type='out_and_back' so the UI badges it.
 
     Returns the core candidate shape plus milestone metadata: snapped waypoints (with a
     moved flag so the UI can explain snapping), the method that fired, D_spine, and the
@@ -318,7 +317,7 @@ async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None
     # GH wants [lon, lat]; the UI speaks (lat, lon).
     start_ll = [start[1], start[0]]
     wp_ll = [[w[1], w[0]] for w in waypoints]
-    cmodel = surface_custom_model(surface)
+    cmodel = route_custom_model(surface)
 
     async with httpx.AsyncClient(timeout=60.0,
                                  limits=httpx.Limits(max_connections=max(n, 32))) as client:
@@ -355,28 +354,9 @@ async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None
             "filter_threshold": filter_min,
         }
 
-        # --- out-and-back: run OUT through the waypoints and retrace home (a true retrace),
-        # honoring pad. Built first when requested; falls back to loop logic if none emerge.
-        if out_back:
-            ob_target = target_m if (pad and target_m is not None) else None
-            ob = await _out_and_back(client, start_ll, wp_ll, snapped_wp_ll, ob_target,
-                                     cmodel, tolerance, eps_m, k)
-            if ob:
-                ref = (target_m if ob_target is not None else ob[0].distance_m) or 1.0
-                for c in ob:
-                    score_candidate(c, ref, ref / MI)
-                ob = _dedup_topk(ob, k)
-                best_err = min((c.breakdown["distance_err"] for c in ob), default=0.0)
-                shortfall = (ob_target is not None) and best_err > tolerance
-                return {**meta, "method": "out_and_back", "pad": bool(pad and target_m is not None),
-                        "over_spine": False, "shortfall": shortfall,
-                        "target_mi": round(target_m / MI, 2) if target_m else None,
-                        "message": (f"closest out-and-back was {ob[0].distance_mi:.2f} mi"
-                                    if shortfall else None),
-                        "candidates": [_serialize(c, r) for r, c in enumerate(ob, 1)]}
-            # else: no out-and-back could be built — fall through to the loop paths below.
-
-        # --- pad=False: derived distance — the spine through the waypoints, as-is.
+        # --- pad=False: derived distance — the spine through the waypoints, as-is. (Folding an
+        # out-and-back here is moot: with no target to pad to we score against d_spine, which
+        # the spine itself fits exactly, so it always wins. Out-and-backs fold into pad mode.)
         if not pad or target_m is None:
             c = _make_candidate(seed=0, gen_distance_m=int(round(d_spine)), path=spine)
             score_candidate(c, d_spine or 1.0, (d_spine or 1.0) / MI)
@@ -396,6 +376,14 @@ async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None
                     "message": (f"the points you picked already make ~{d_spine / MI:.1f} mi; "
                                 f"can't build a {target_mi:.1f}-mi loop through all of them")}
 
+        # --- pure out-and-backs through the waypoints, padded to target. Folded into whichever
+        # loop pool is chosen below and ranked alongside the loops (mirrors the Loops tab's
+        # extra_candidates). Built once here; each is already tagged route_type='out_and_back'.
+        ob_cands = await _out_and_back(client, start_ll, wp_ll, snapped_wp_ll, target_m,
+                                       cmodel, tolerance, eps_m, k)
+        for c in ob_cands:
+            score_candidate(c, target_m, target_mi)
+
         # --- FILTER (primary): fire the unchanged round_trip fan-out at the target, biased
         # toward the first waypoint, and keep loops that pass within ε of EVERY waypoint.
         rng = _seeded_seeds(n)
@@ -407,36 +395,40 @@ async def milestone(start: tuple, waypoints: list[tuple], target_m: float | None
         kept = [c for c in fired
                 if abs(c.distance_m - target_m) / target_m <= max(tolerance, 0.12)
                 and passes_through(c.coords, snapped_wp_ll, eps_m)]
-        filtered_top = _dedup_topk(kept, k)
+        # The yield decision (filter vs decompose) is about LOOP quality, so it counts distinct
+        # loops only — out-and-backs are an addition, not a substitute for real filtered loops.
+        filtered_loops = _dedup_topk(kept, k)
 
-        if len(filtered_top) >= filter_min:
-            best_err = min((c.breakdown["distance_err"] for c in filtered_top), default=1.0)
+        if len(filtered_loops) >= filter_min:
+            chosen = _dedup_topk(kept + ob_cands, k)
+            best_err = min((c.breakdown["distance_err"] for c in chosen), default=1.0)
             return {**meta, "method": "filter", "pad": True, "over_spine": False,
-                    "filter_yield": len(filtered_top),
+                    "filter_yield": len(filtered_loops),
                     "shortfall": best_err > tolerance,
-                    "message": (f"closest filtered loop was {filtered_top[0].distance_mi:.2f} mi"
+                    "message": (f"closest route was {chosen[0].distance_mi:.2f} mi"
                                 if best_err > tolerance else None),
-                    "candidates": [_serialize(c, r) for r, c in enumerate(filtered_top, 1)]}
+                    "candidates": [_serialize(c, r) for r, c in enumerate(chosen, 1)]}
 
         # --- DECOMPOSE (fallback): guarantee inclusion by construction.
         decomposed = await _decompose(client, start_ll, wp_ll, snapped_wp_ll, target_m,
                                       cmodel, k, tolerance)
+        for c in decomposed:
+            score_candidate(c, target_m, target_mi)
         # Prefer decomposition (guaranteed inclusion by construction); if it somehow returned
-        # nothing, fall back to whatever in-ε filtered loops we did find.
-        chosen = decomposed if decomposed else filtered_top
-        method = "decompose" if decomposed else "filter"
+        # nothing, fall back to whatever in-ε filtered loops we did find. Out-and-backs fold in
+        # either way, so a pure-out-and-back result is still possible when no loop survives.
+        loop_pool = decomposed if decomposed else kept
+        method = "decompose" if decomposed else ("filter" if kept else "out_and_back")
+        chosen = _dedup_topk(loop_pool + ob_cands, k)
         if not chosen:
             return {**meta, "method": "none", "pad": True, "over_spine": False,
                     "shortfall": True, "candidates": [],
-                    "message": "could not build a loop through those waypoints at that distance"}
-        for c in chosen:
-            score_candidate(c, target_m, target_mi)
-        chosen = _dedup_topk(chosen, k)
+                    "message": "could not build a route through those waypoints at that distance"}
         best_err = min((c.breakdown["distance_err"] for c in chosen), default=1.0)
         return {**meta, "method": method, "pad": True, "over_spine": False,
-                "filter_yield": len(filtered_top),
+                "filter_yield": len(filtered_loops),
                 "shortfall": best_err > tolerance,
-                "message": (f"closest loop was {chosen[0].distance_mi:.2f} mi (target "
+                "message": (f"closest route was {chosen[0].distance_mi:.2f} mi (target "
                             f"{target_mi:.1f} mi)" if best_err > tolerance else None),
                 "candidates": [_serialize(c, r) for r, c in enumerate(chosen, 1)]}
 

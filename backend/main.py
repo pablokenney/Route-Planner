@@ -30,11 +30,12 @@ from .generator import (
     generate,
     parse_instructions,
     round_trip_body,
-    surface_custom_model,
+    route_custom_model,
     synthesize_turns,
 )
 from .milestone import milestone as milestone_generate
 from .outback import out_and_backs
+from .segment_seek import segment_loops
 
 GH = os.environ.get("GH_URL", "http://localhost:8989")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,10 +113,18 @@ async def routes(
             return {**cached, "cached": True}
 
     try:
-        extra = (await out_and_backs(start=(lat, lon), target_m=miles * MI, surface=surface)
-                 if out_back else None)
+        # Fold two kinds of constructed routes into the same pool the random loops compete in:
+        # pure out-and-backs, and loops that pass through nearby known segments (the latter so
+        # a loved trail like the LeTort Nature Trail actually shows up — round_trip never seeks
+        # it on its own). Both are scored/de-duped/ranked by generate()'s single objective.
+        extra: list = []
+        if out_back:
+            extra += await out_and_backs(start=(lat, lon), target_m=miles * MI, surface=surface)
+        extra += await segment_loops(start=(lat, lon), target_m=miles * MI,
+                                     surface=surface, tolerance=tolerance, k=k)
         result = await generate(miles * MI, n=n, tolerance=tolerance, k=k,
-                                start=(lat, lon), surface=surface, extra_candidates=extra)
+                                start=(lat, lon), surface=surface,
+                                extra_candidates=extra or None)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(503, f"Generation failed (is GraphHopper up?): {e}")
     if not result["candidates"]:
@@ -159,7 +168,7 @@ def _round_trip(distance_m: int, seed: int, start, surface: str,
     try:
         r = requests.post(f"{GH}/route",
                           json=round_trip_body(seed, distance_m, start,
-                                               surface_custom_model(surface),
+                                               route_custom_model(surface),
                                                instructions=instructions),
                           timeout=60)
     except requests.ConnectionError:
@@ -337,9 +346,11 @@ async def milestone_route(payload: dict = Body(...)):
       miles                          (target; ignored when pad=false),
       surface                        ('any'|'paved'|'unpaved'),
       pad                            (true=pad to target, false=derived distance),
-      out_back                       (true=out-and-back retrace through waypoints, not a loop),
       eps_m, tolerance, k            (optional tunables)
     }
+    Loops AND pure out-and-backs through the waypoints are returned together, ranked and
+    badged side by side (out-and-backs carry route_type='out_and_back').
+
     Returns the core candidate shape plus milestone metadata: which method fired
     (filter/decompose/derived/out_and_back/over_spine), snapped waypoints, D_spine, and the
     honest over_spine flag when the waypoints are already farther apart than the target.
@@ -351,7 +362,6 @@ async def milestone_route(payload: dict = Body(...)):
     if surface not in SURFACE_CHOICES:
         raise HTTPException(422, f"surface must be one of {SURFACE_CHOICES}")
     pad = bool(payload.get("pad", True))
-    out_back = bool(payload.get("out_back", False))
     miles = payload.get("miles", None)
     target_m = float(miles) * MI if (pad and miles is not None) else None
     if pad and target_m is None:
@@ -365,7 +375,7 @@ async def milestone_route(payload: dict = Body(...)):
     try:
         result = await milestone_generate(
             start=(lat, lon), waypoints=wps, target_m=target_m, surface=surface,
-            pad=pad, eps_m=eps_m, tolerance=tolerance, k=k, out_back=out_back)
+            pad=pad, eps_m=eps_m, tolerance=tolerance, k=k)
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:  # noqa: BLE001

@@ -33,6 +33,16 @@
     .presets button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     .row { display:flex; gap:8px; align-items:center; margin-top:8px; }
     .label { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    /* Collapsible control sections (Surface / Saved starts / Saved milestones). */
+    details.sect { margin-top:14px; }
+    details.sect > summary { list-style:none; cursor:pointer; user-select:none;
+      display:flex; align-items:center; gap:6px;
+      font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); }
+    details.sect > summary::-webkit-details-marker { display:none; }
+    details.sect > summary::before { content:'▸'; font-size:9px; color:var(--muted);
+      transition:transform .12s; }
+    details.sect[open] > summary::before { transform:rotate(90deg); }
+    details.sect > .sect-body { margin-top:8px; }
     .starts { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 4px; min-height:8px; }
     .starts .chip { display:flex; align-items:center; gap:5px; background:var(--panel2);
                     border:1px solid var(--line); border-radius:14px; padding:3px 6px 3px 10px;
@@ -112,10 +122,6 @@
             <button data-pad="1" class="active" title="Pad out to the target distance">Pad to target</button>
             <button data-pad="0" title="Just route through the points, report the distance">Exact (derived)</button>
           </div>
-          <div class="presets" id="msShape" style="margin-top:8px">
-            <button data-ob="0" class="active" title="Loop: return by a different route">◯ Loop</button>
-            <button data-ob="1" title="Out &amp; back: run out through the points and retrace the same path home">↩ Out &amp; back</button>
-          </div>
         </div>
 
         <div class="label" style="margin-top:14px">Distance</div>
@@ -131,28 +137,39 @@
           <button id="go" style="margin-left:auto">Generate loops</button>
         </div>
 
-        <div class="label" style="margin-top:14px">Surface</div>
-        <div class="presets" id="surface">
-          <button data-surf="any" class="active" title="No preference">Any</button>
-          <button data-surf="paved" title="Prefer paved/asphalt">Paved</button>
-          <button data-surf="unpaved" title="Prefer trails/unpaved">Unpaved</button>
-        </div>
-
-        <div class="label" style="margin-top:14px"><span id="savedLabel">Saved starts</span></div>
-        <div id="starts" class="starts"></div>
-        <div class="row">
-          <input id="startNameInput" type="text" placeholder="Name this start" style="flex:1;width:auto" />
-          <button id="saveStart" class="ghost">Save current</button>
-        </div>
-        <!-- Milestone-only: saved milestones -->
-        <div id="msSavedBlock" style="display:none">
-          <div class="label" style="margin-top:14px">Saved milestones</div>
-          <div id="msSaved" class="starts"></div>
-          <div class="row">
-            <input id="msNameInput" type="text" placeholder="Name this milestone" style="flex:1;width:auto" />
-            <button id="msSave" class="ghost">Save current</button>
+        <details class="sect" id="surfaceSect" open>
+          <summary>Surface</summary>
+          <div class="sect-body">
+            <div class="presets" id="surface">
+              <button data-surf="any" class="active" title="No preference">Any</button>
+              <button data-surf="paved" title="Prefer paved/asphalt">Paved</button>
+              <button data-surf="unpaved" title="Prefer trails/unpaved">Unpaved</button>
+            </div>
           </div>
-        </div>
+        </details>
+
+        <details class="sect" id="startsSect">
+          <summary><span id="savedLabel">Saved starts</span></summary>
+          <div class="sect-body">
+            <div id="starts" class="starts"></div>
+            <div class="row">
+              <input id="startNameInput" type="text" placeholder="Name this start" style="flex:1;width:auto" />
+              <button id="saveStart" class="ghost">Save current</button>
+            </div>
+          </div>
+        </details>
+
+        <!-- Milestone-only: saved milestones -->
+        <details class="sect" id="msSavedBlock" style="display:none">
+          <summary>Saved milestones</summary>
+          <div class="sect-body">
+            <div id="msSaved" class="starts"></div>
+            <div class="row">
+              <input id="msNameInput" type="text" placeholder="Name this milestone" style="flex:1;width:auto" />
+              <button id="msSave" class="ghost">Save current</button>
+            </div>
+          </div>
+        </details>
       </div>
       <div id="status">Pick a distance and generate.</div>
       <div class="cards" id="cards"></div>
@@ -186,7 +203,7 @@
 
   let state = { start: HOME.slice(), startName: 'Home', miles: 5, surface: 'any',
                 data: null, sel: -1, layers: [], chart: null, starts: [],
-                mode: 'loops', pad: true, outBack: false, turns: [],
+                mode: 'loops', pad: true, turns: [],
                 waypoints: [], wpMarkers: [], snapMarkers: [], milestones: [] };
 
   const map = L.map('map', { zoomControl: true }).setView(HOME, 14);
@@ -407,13 +424,14 @@
   async function generateMilestone(){
     if(!state.waypoints.length){ setStatus('Drop or type at least one required waypoint.', true); return; }
     const mi = parseFloat(document.getElementById('miles').value); state.miles = mi;
-    const shape = state.outBack ? 'out-and-back route' : 'loop';
-    setStatus(state.pad ? `Building ${shape}s through ${state.waypoints.length} point(s) near ${mi} mi…`
+    setStatus(state.pad ? `Building loops through ${state.waypoints.length} point(s) near ${mi} mi…`
                         : `Routing through ${state.waypoints.length} point(s)…`);
     document.getElementById('cards').innerHTML='';
+    // Milestone returns loops AND pure out-and-backs through the waypoints, ranked together
+    // and badged (like the Loops tab) — no shape toggle.
     const body = { waypoints: state.waypoints.map(w=>({lat:w[0],lon:w[1]})),
       lat: state.start[0], lon: state.start[1], surface: state.surface,
-      pad: state.pad, out_back: state.outBack };
+      pad: state.pad };
     if(state.pad) body.miles = mi;
     try{
       const res = await fetch('/api/milestone', { method:'POST',
@@ -424,10 +442,9 @@
       if(d.over_spine){ setStatus('⚠ '+d.message, true); document.getElementById('cards').innerHTML=''; return; }
       const methodNote = { filter:'filtered round-trips', decompose:'built (out-and-back + loop)',
         derived:'exact route through points', out_and_back:'out-and-back retrace' }[d.method] || d.method;
-      const noun = state.outBack ? 'route' : 'loop';
       const snapNote = (d.snapped_waypoints||[]).some(s=>s.moved) ? ' · some pins snapped to nearest runnable point' : '';
       if(d.shortfall) setStatus(`⚠ ${d.message||'closest available'} — ${methodNote}.${snapNote}`, true);
-      else setStatus(`${d.candidates.length} ${noun}${d.candidates.length!==1?'s':''} through all points · ${methodNote}${snapNote}.`);
+      else setStatus(`${d.candidates.length} route${d.candidates.length!==1?'s':''} through all points · ${methodNote}${snapNote}.`);
       drawAll(); renderCards();
       if(d.candidates.length) select(0);
     }catch(e){ setStatus('Error: '+e.message, true); }
@@ -633,10 +650,6 @@
   document.querySelectorAll('#msPad button').forEach(b=>{
     b.onclick = ()=>{ document.querySelectorAll('#msPad button').forEach(x=>x.classList.remove('active'));
       b.classList.add('active'); state.pad = b.dataset.pad==='1'; generate(); };
-  });
-  document.querySelectorAll('#msShape button').forEach(b=>{
-    b.onclick = ()=>{ document.querySelectorAll('#msShape button').forEach(x=>x.classList.remove('active'));
-      b.classList.add('active'); state.outBack = b.dataset.ob==='1'; generate(); };
   });
   document.getElementById('msAddAddr').onclick = addWaypointByAddr;
   document.getElementById('msAddr').addEventListener('keydown', e=>{ if(e.key==='Enter') addWaypointByAddr(); });
